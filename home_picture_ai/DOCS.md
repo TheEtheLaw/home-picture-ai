@@ -9,9 +9,10 @@ what it saw, so each TV can tell its program from the ads. The TV decides when t
 There's nothing to set. Start it once and leave **Start on boot** and **Watchdog** on. The TVs find it by
 themselves on the home network (it announces itself there as `_homeai._tcp`, port 8765).
 
-The first start downloads the AI model once (352 MB, from Hugging Face, at a fixed version, checked by its SHA-256)
-into this app's own storage. Until it's there, the log says how far it got and the TVs wait. The model is left out
-of Home Assistant's backups, since it downloads again by itself.
+The first start downloads the AI models once (352 MB and 46 MB, from Hugging Face, at fixed versions, each checked
+by its SHA-256) into this app's own storage. Until the main one is there, the log says how far it got and the TVs
+wait; the second one comes after it. The models are left out of Home Assistant's backups, since they download again
+by themselves.
 
 ## What it keeps
 
@@ -25,7 +26,14 @@ devices on the home network (private addresses).
   `embedding` is what the AI saw (512 numbers, float32, base64) for the TV to compare with its program's usual look
   (under `like`: not the program). The lean is measured against `direction.bin`: the average of 14 descriptions of
   ads minus the average of 15 descriptions of programs, made once with CLIP's text half.
-- `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up"}`.
+- `POST /look?spot=x0,y0,x1,y1`: the same, and a second look at that spot of the picture (where the TV found the
+  channel's own logo): `{"spot_model", "spot", "spot_like", "spot_ms"}` besides. `spot` is what the second model saw
+  there (512 numbers, float32, base64), for the TV to compare with the spot's usual look (at or over `spot_like`: the
+  logo's there). Left out while the second model isn't ready.
+- `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
+  "spot_note", "spot_looks", "spot_ms"}`.
 
-The model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy
-(`Xenova/clip-vit-base-patch32`), run with Microsoft's ONNX Runtime (MIT license) on 3 of the processor's cores.
+The main model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy
+(`Xenova/clip-vit-base-patch32`), run with Microsoft's ONNX Runtime (MIT license) on 3 of the processor's cores. The
+second is the picture half of Apple's MobileCLIP2-S0, under Apple's research license (`apple-amlr`), from plhery's
+ONNX copy (`plhery/mobileclip2-onnx`), on the fourth core.
