@@ -20,9 +20,11 @@ devices on the home network (private addresses).
 
 ## How it works
 
-- `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "ms"}`. `score` is how far the picture
-  leans toward an ad (over `ad`: an ad), `embedding` is what the AI saw (512 numbers, float32, base64) for the TV to
-  compare with its program's usual look (under `like`: not the program).
+- `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "ms"}`. `score` is how far the
+  picture leans toward an ad (over `ad`: an ad; until the TV knows the channel, it has to be past `ad` by `sure`),
+  `embedding` is what the AI saw (512 numbers, float32, base64) for the TV to compare with its program's usual look
+  (under `like`: not the program). The lean is measured against `direction.bin`: the average of 14 descriptions of
+  ads minus the average of 15 descriptions of programs, made once with CLIP's text half.
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up"}`.
 
 The model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy

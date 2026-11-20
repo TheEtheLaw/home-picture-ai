@@ -25,15 +25,16 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
              '6b7c523703ae26e39be4b03774966f8571c7f523/onnx/vision_model.onnx')
 MODEL_SIZE = 351_685_709
 MODEL_SHA = 'fd6e1402a588279d1723c7534d4bcba5bc0b14b47dfab0e46f8c47b8270d7d40'
-# Over AD: an ad; under LIKE: not the program the channel has been showing (set on his two recordings).
-AD, LIKE = -0.022, 0.70
+# Over AD: an ad; under LIKE: not the program the channel has been showing (set on his two recordings). Until a TV
+# knows a channel's look, the score alone has to clear AD by SURE either way (between: not sure).
+AD, LIKE, SURE = -0.0253, 0.70, 0.01
 SIZE = 224
 MAX_PIXELS = 4_000_000  # a picture bigger than 2560x1440 is turned away
 MEAN = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)
@@ -147,7 +148,7 @@ def look(jpeg):
     e = e / np.linalg.norm(e)
     state['looks'] += 1
     state['ms'] = ms if state['looks'] == 1 else state['ms'] * 0.95 + ms * 0.05
-    return {'model': MODEL_ID, 'score': float(e @ direction), 'ad': AD, 'like': LIKE, 'ms': round(ms),
+    return {'model': MODEL_ID, 'score': float(e @ direction), 'ad': AD, 'like': LIKE, 'sure': SURE, 'ms': round(ms),
             'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
 
 
