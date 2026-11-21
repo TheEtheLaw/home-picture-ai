@@ -30,10 +30,15 @@ devices on the home network (private addresses).
   channel's own logo): `{"spot_model", "spot", "spot_like", "spot_ms"}` besides. `spot` is what the second model saw
   there (512 numbers, float32, base64), for the TV to compare with the spot's usual look (at or over `spot_like`: the
   logo's there). Left out while the second model isn't ready.
+- `POST /read` with a PNG or JPEG of a logo's spot (since 1.2.0): `{"read_model", "lines", "read_ms"}`, where
+  `lines` are the logo's lines of letters, top to bottom, each `{"text", "score"}`. The TV sends a few pictures of the
+  spot put together (so what moves behind the logo fades) and checks the letters against the channel's name.
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
-  "spot_note", "spot_looks", "spot_ms"}`.
+  "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms"}`.
 
 The main model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy
 (`Xenova/clip-vit-base-patch32`), run with Microsoft's ONNX Runtime (MIT license) on 3 of the processor's cores. The
 second is the picture half of Apple's MobileCLIP2-S0, under Apple's research license (`apple-amlr`), from plhery's
-ONNX copy (`plhery/mobileclip2-onnx`), on the fourth core.
+ONNX copy (`plhery/mobileclip2-onnx`), on the fourth core. Logos are read by PaddleOCR's PP-OCRv4 detection and
+recognition models (Apache-2.0), from RapidOCR's ONNX copies (Apache-2.0, in its package, which comes with the app),
+on one core for a moment when a TV asks.

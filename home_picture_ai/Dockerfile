@@ -8,6 +8,10 @@ RUN pip install --only-binary=:all: \
         onnxruntime==1.31.1 numpy==2.5.5 pillow==13.0.0 zeroconf==0.154.0 \
         flatbuffers==25.12.19 packaging==26.3 protobuf==7.36.2 ifaddr==0.2.0
 
+# Reading logos (1.2.0): RapidOCR's package only for its two PP-OCRv4 models (the server checks them; its own code,
+# which would need OpenCV, isn't used).
+RUN pip install --only-binary=:all: --no-deps rapidocr-onnxruntime==1.4.4
+
 COPY server.py direction.bin /app/
 
 CMD ["python3", "-u", "/app/server.py"]

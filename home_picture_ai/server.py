@@ -6,18 +6,26 @@ CLIP ViT-B/32's picture tower (OpenAI, MIT; Xenova's ONNX copy at a fixed versio
 into the add-on's own storage and used only if its SHA-256 is right. Since 1.1.0 a TV can also ask about one spot of
 the picture, where it has found the channel's own logo: Apple's MobileCLIP2-S0 picture tower looks at that spot,
 zoomed, on its own core at the same time, and says what it saw there (for how much it looks like the logo's spot
-usually does, which the TV keeps). Nothing leaves the home network: the pictures are looked at and forgotten, never
-kept or logged. Announced on the network (mDNS, _homeai._tcp) so the TVs find it.
+usually does, which the TV keeps). Since 1.2.0 a TV can ask it to read the letters of a logo it has found (the
+logo's spot, a few pictures put together so what moves behind it fades): PaddleOCR's PP-OCRv4 models (Apache-2.0,
+RapidOCR's ONNX copies, in its package at a fixed version, each model checked by its SHA-256) find its lines of letters
+and read them, so the TV can tell the channel's own logo (it spells the channel's name) from other marks that don't
+move. Nothing leaves the home network: the pictures are looked at and forgotten, never kept or logged. Announced on
+the network (mDNS, _homeai._tcp) so the TVs find it.
 
     POST /look[?spot=x0,y0,x1,y1]   a JPEG  ->  {"model", "score", "embedding" (512 float32, base64), "ad", "like",
                                                 "sure", "ms"}, and for a spot {"spot_model", "spot", "spot_like", "spot_ms"}
+    POST /read                      a PNG or JPEG (a logo's spot)  ->  {"read_model", "lines" [{"text", "score"}],
+                                                "read_ms"}
     GET  /status                            ->  {"model", "version", "ready", "note", "looks", "ms", "up", "spot_model",
-                                                "spot_ready", "spot_note", "spot_looks", "spot_ms"}
+                                                "spot_ready", "spot_note", "spot_looks", "spot_ms", "read_model",
+                                                "read_ready", "read_note", "reads", "read_ms"}
 """
 import base64
 import concurrent.futures
 import hashlib
 import http.server
+import importlib.util
 import io
 import ipaddress
 import json
@@ -31,7 +39,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -61,12 +69,23 @@ SPOT_LIKE = 0.78
 SPOT_IN = 256
 SPOT_MODEL = os.path.join(DATA, 'mobileclip2-s0-vision.onnx')
 SPOT_THREADS = int(os.environ.get('SPOT_THREADS', '1'))
+# Reading a logo (1.2.0): PaddleOCR's PP-OCRv4 detection and recognition models (Apache-2.0), RapidOCR's ONNX copies,
+# from its package (rapidocr-onnxruntime 1.4.4, installed without the rest of it); each checked before it's used.
+READ_ID = 'ppocr-v4'
+READ_FILES = {'det': ('ch_PP-OCRv4_det_infer.onnx', 'd2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9'),
+              'rec': ('ch_PP-OCRv4_rec_infer.onnx', '48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b')}
+READ_PIXELS = 2_600_000  # a logo's spot: up to about 1600x1600
+READ_SIDE = 256          # the spot is looked for letters with its longer side this long
+READ_LINE_H = 48         # each line is read this high
 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
-         'spot_ready': False, 'spot_note': 'waiting for the main model', 'spot_looks': 0, 'spot_ms': 0.0}
+         'spot_ready': False, 'spot_note': 'waiting for the main model', 'spot_looks': 0, 'spot_ms': 0.0,
+         'read_ready': False, 'read_note': 'waiting for the other models', 'reads': 0, 'read_ms': 0.0}
 session = None
 spot_session = None
+reader = None
+read_lock = threading.Lock()
 run_lock = threading.Lock()
 spot_lock = threading.Lock()
 spot_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -161,6 +180,126 @@ def load_spot():
     state['spot_note'] = 'ready (loaded in %.1f s, %d thread)' % (time.time() - t0, SPOT_THREADS)
     say("the logo's model: " + state['spot_note'])
     return True
+
+
+class Reader:
+    """A logo's lines of letters: the detection model's map of where letters are, split into lines by the rows and
+    columns where there are none, and each line read by the recognition model (its best path)."""
+
+    def __init__(self, det_path, rec_path):
+        o = ort.SessionOptions()
+        o.intra_op_num_threads = 1
+        o.inter_op_num_threads = 1
+        o.add_session_config_entry('session.intra_op.allow_spinning', '0')
+        self.det = ort.InferenceSession(det_path, o, providers=['CPUExecutionProvider'])
+        self.rec = ort.InferenceSession(rec_path, o, providers=['CPUExecutionProvider'])
+        chars = self.rec.get_modelmeta().custom_metadata_map['character'].splitlines()
+        self.chars = [''] + chars + [' ']
+
+    def read(self, im):
+        rgb = im.convert('RGB')
+        w, h = rgb.size
+        k = READ_SIDE / max(w, h)
+        dw, dh = max(32, int(round(w * k / 32)) * 32), max(32, int(round(h * k / 32)) * 32)
+        x = (np.asarray(rgb.resize((dw, dh), Image.BICUBIC), np.float32) / 255.0 - 0.5) / 0.5
+        prob = self.det.run(None, {'x': x.transpose(2, 0, 1)[None]})[0][0, 0]
+        sx, sy = w / dw, h / dh
+        out = []
+        for x0, y0, x1, y1 in letter_lines(prob):
+            line = rgb.crop((int(x0 * sx), int(y0 * sy), int(np.ceil(x1 * sx)), int(np.ceil(y1 * sy))))
+            text, score = self.read_line(line)
+            if text.strip():
+                out.append({'text': text.strip(), 'score': round(score, 3)})
+        return out
+
+    def read_line(self, line):
+        w, h = line.size
+        nw = max(16, min(1280, int(round(READ_LINE_H * w / max(1, h)))))
+        x = (np.asarray(line.resize((nw, READ_LINE_H), Image.BICUBIC), np.float32) / 255.0 - 0.5) / 0.5
+        p = self.rec.run(None, {'x': x.transpose(2, 0, 1)[None]})[0][0]
+        best, conf = p.argmax(1), p.max(1)
+        text, scores, last = [], [], 0
+        for i, c in zip(best, conf):
+            if i != last and i != 0:
+                text.append(self.chars[i] if i < len(self.chars) else '')
+                scores.append(float(c))
+            last = i
+        return ''.join(text), (sum(scores) / len(scores) if scores else 0.0)
+
+
+def letter_lines(prob, thresh=0.3, keep=0.5, unclip=1.6):
+    """The detection map's lines (x0, y0, x1, y1): rows with letters split where there are none, each band's columns
+    split where a gap is wider than the band is high; a line's average must be at least `keep`; widened back (the
+    model draws them shrunk)."""
+    on = prob > thresh
+    H, W = on.shape
+    boxes = []
+    for r0, r1 in stretches(on.any(1), 1):
+        band = on[r0:r1]
+        for c0, c1 in stretches(band.any(0), max(2, int((r1 - r0) * 1.2))):
+            rows = np.where(on[r0:r1, c0:c1].any(1))[0]
+            y0, y1 = r0 + rows[0], r0 + rows[-1] + 1
+            area = on[y0:y1, c0:c1]
+            if min(c1 - c0, y1 - y0) < 2 or float(prob[y0:y1, c0:c1][area].mean()) < keep:
+                continue
+            d = (c1 - c0) * (y1 - y0) * unclip / (2 * ((c1 - c0) + (y1 - y0)))
+            boxes.append((max(0, c0 - d), max(0, y0 - d), min(W, c1 + d), min(H, y1 + d)))
+    return boxes
+
+
+def stretches(mask, gap):
+    """Where a row of true/false is true, joined over gaps shorter than `gap`."""
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        return []
+    out, s, p = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i - p > gap:
+            out.append((s, p + 1))
+            s = i
+        p = i
+    out.append((s, p + 1))
+    return out
+
+
+def load_read():
+    """The reading models, from RapidOCR's package, each checked; true once they're ready."""
+    global reader
+    t0 = time.time()
+    spec = importlib.util.find_spec('rapidocr_onnxruntime')
+    if spec is None or not spec.submodule_search_locations:
+        state['read_note'] = "the reading models' package isn't here"
+        say(state['read_note'])
+        return False
+    where = os.path.join(list(spec.submodule_search_locations)[0], 'models')
+    paths = {}
+    for k, (name, sha) in READ_FILES.items():
+        p = os.path.join(where, name)
+        if not os.path.isfile(p) or sha256(p) != sha:
+            state['read_note'] = "the reading model %s isn't the one expected (its check didn't match)" % name
+            say(state['read_note'])
+            return False
+        paths[k] = p
+    r = Reader(paths['det'], paths['rec'])
+    r.read(Image.new('RGB', (64, 32)))
+    reader = r
+    state['read_ready'] = True
+    state['read_note'] = 'ready (loaded in %.1f s, 1 thread)' % (time.time() - t0)
+    say('reading logos: ' + state['read_note'])
+    return True
+
+
+def read_logo(data):
+    im = Image.open(io.BytesIO(data))
+    if im.width * im.height > READ_PIXELS or min(im.width, im.height) < 8:
+        raise ValueError('size')
+    t0 = time.time()
+    with read_lock:
+        lines = reader.read(im)
+    ms = (time.time() - t0) * 1000
+    state['reads'] += 1
+    state['read_ms'] = ms if state['reads'] == 1 else state['read_ms'] * 0.9 + ms * 0.1
+    return {'read_model': READ_ID, 'lines': lines, 'read_ms': round(ms)}
 
 
 def axis(n_in):
@@ -265,15 +404,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {'model': MODEL_ID, 'version': VERSION, 'ready': state['ready'], 'note': state['note'], 'looks': state['looks'],
                                     'ms': round(state['ms']), 'up': round(time.time() - state['since']), 'spot_model': SPOT_ID,
                                     'spot_ready': state['spot_ready'], 'spot_note': state['spot_note'], 'spot_looks': state['spot_looks'],
-                                    'spot_ms': round(state['spot_ms'])})
-        self.reply(404, {'note': 'GET /status or POST /look'})
+                                    'spot_ms': round(state['spot_ms']), 'read_model': READ_ID, 'read_ready': state['read_ready'],
+                                    'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms'])})
+        self.reply(404, {'note': 'GET /status, POST /look or POST /read'})
 
     def do_POST(self):
         if not home_network(self.client_address[0]):
             return self.reply(403, {'note': 'home network only'})
         path, _, query = self.path.partition('?')
+        if path == '/read':
+            n = int(self.headers.get('Content-Length') or 0)
+            if n <= 0 or n > 4_000_000:
+                return self.reply(400, {'note': 'a PNG or JPEG, up to 4 MB'})
+            body = self.rfile.read(n)
+            if not state['read_ready']:
+                return self.reply(503, {'note': state['read_note']})
+            try:
+                return self.reply(200, read_logo(body))
+            except Exception as e:
+                return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
         if path != '/look':
-            return self.reply(404, {'note': 'POST /look'})
+            return self.reply(404, {'note': 'POST /look or POST /read'})
         box = None
         for kv in query.split('&'):
             if kv.startswith('spot='):
@@ -361,6 +512,11 @@ def main():
             say(state['spot_note'])
             time.sleep(wait)
             wait = min(wait * 2, 1800)
+    try:  # reading logos (in the app itself, nothing to download)
+        load_read()
+    except Exception as e:
+        state['read_note'] = "the reading models didn't load (%s)" % type(e).__name__
+        say(state['read_note'])
     while True:
         time.sleep(3600)
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- Reads a logo's letters: a TV can send the spot where it found a mark that doesn't move (`POST /read`, a PNG or
+  JPEG), and PaddleOCR's PP-OCRv4 models find its lines of letters and read them. The TV checks them against the
+  channel's name, so it can tell the channel's own logo from a scoreboard or a provider's mark right away, instead of
+  waiting for the channel's first break.
+- The two models (15 MB) come with the app, in RapidOCR's package (`rapidocr-onnxruntime` 1.4.4), and each is checked
+  by its SHA-256 before it's used. Nothing more to download. Reading takes one core for a moment, and only when a TV
+  asks (once for each new logo).
+
 ## 1.1.0
 
 - A second look, at the channel's logo: a TV can send the spot where it found the channel's own logo along with a
