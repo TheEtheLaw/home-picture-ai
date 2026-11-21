@@ -17,6 +17,7 @@ More in [home_picture_ai/DOCS.md](home_picture_ai/DOCS.md).
 The AI models aren't in this repository: the app downloads them on first start. The main one is the picture half of
 OpenAI's CLIP ViT-B/32 (MIT license), as converted to ONNX by Xenova. The second, which looks at the channel's logo,
 is the picture half of Apple's MobileCLIP2-S0, under Apple's research license (`apple-amlr`), as converted to ONNX by
-plhery. ONNX Runtime is Microsoft's (MIT license).
+plhery. Logos are read by PaddleOCR's PP-OCRv4 models (Apache-2.0), as converted to ONNX by RapidOCR (Apache-2.0),
+which come with the app in RapidOCR's package. ONNX Runtime is Microsoft's (MIT license).
 `direction.bin` is 512 numbers made once with CLIP's text half from two sets of words: TV commercials of every
 kind, and TV programs (sports, news, shows, films).
