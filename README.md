@@ -1,8 +1,9 @@
 # Home picture AI
 
 A Home Assistant app (add-on) that runs the picture AI for Home's ad screen: the TVs on the home network send it
-the small picture they're watching and it says whether it's an ad. It runs on the Home Assistant machine (a
-Raspberry Pi 4 here) so the TVs don't have to.
+the small picture they're watching and it says whether it's an ad, and it remembers the ads they've seen (as the
+AI's fingerprints, not pictures). It runs on the Home Assistant machine (a Raspberry Pi 4 here) so the TVs don't
+have to.
 
 ## Installing
 
