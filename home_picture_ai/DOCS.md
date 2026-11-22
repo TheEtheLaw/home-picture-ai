@@ -16,15 +16,27 @@ by themselves.
 
 ## What it keeps
 
-Nothing. Each picture is looked at and forgotten: never saved, never logged, never sent anywhere. It answers only
+No pictures. Each picture is looked at and forgotten: never saved, never logged, never sent anywhere. It answers only
 devices on the home network (private addresses).
+
+Since 1.3.0 it remembers the ads the TVs have seen, as the AI's fingerprints (512 numbers each, not pictures): once a
+TV's ad screen has covered a break, the TV sends the fingerprints of the ads in it, one a second. Each ad is kept
+once (a fingerprint 0.95 or more like a kept one is that one, seen again), with no limit: about half a kilobyte each,
+roughly 80 MB a year at a few hours of TV a day, in this app's own storage (`ads.npz`, and `ads.log` for the newest,
+folded in as it grows), in Home Assistant's backups. A ceiling of 2 million (about 1 GB, decades of watching) keeps
+it from ever filling the storage; only then do the ones seen longest ago go. From 8,192 ads on they're grouped by
+how they look, so each picture is compared only with the few groups it could be in: with a million ads an answer
+takes a few thousandths of a second longer. Every answer says how like the nearest remembered ad the picture is, so
+an ad seen before is known right away, on any channel and by either TV. A different main model starts the memory
+over.
 
 ## How it works
 
-- `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "ms"}`. `score` is how far the
-  picture leans toward an ad (over `ad`: an ad; until the TV knows the channel, it has to be past `ad` by `sure`),
-  `embedding` is what the AI saw (512 numbers, float32, base64) for the TV to compare with its program's usual look
-  (under `like`: not the program). The lean is measured against `direction.bin`: the average of 14 descriptions of
+- `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how
+  far the picture leans toward an ad (over `ad`: an ad; until the TV knows the channel, it has to be past `ad` by
+  `sure`), `embedding` is what the AI saw (512 numbers, float32, base64) for the TV to compare with its program's
+  usual look (under `like`: not the program), and `known` (since 1.3.0) how like the nearest remembered ad it is (0
+  to 1; 0.95 or more: an ad seen before). The lean is measured against `direction.bin`: the average of 14 descriptions of
   ads minus the average of 15 descriptions of programs, made once with CLIP's text half.
 - `POST /look?spot=x0,y0,x1,y1`: the same, and a second look at that spot of the picture (where the TV found the
   channel's own logo): `{"spot_model", "spot", "spot_like", "spot_ms"}` besides. `spot` is what the second model saw
@@ -33,8 +45,13 @@ devices on the home network (private addresses).
 - `POST /read` with a PNG or JPEG of a logo's spot (since 1.2.0): `{"read_model", "lines", "read_ms"}`, where
   `lines` are the logo's lines of letters, top to bottom, each `{"text", "score"}`. The TV sends a few pictures of the
   spot put together (so what moves behind the logo fades) and checks the letters against the channel's name.
+- `POST /ads` (since 1.3.0) with `{"model", "ads": [[scale, fingerprint], ...]}`, each fingerprint 512 numbers of a
+  byte each (base64), times its scale: a covered break's ads, at most 600 at a time. Answers `{"new", "again",
+  "ads"}`: how many were new, how many were seen before, and how many it remembers now. Fingerprints from another
+  model are turned away (409).
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
-  "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms"}`.
+  "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms", "ads",
+  "ads_note"}`.
 
 The main model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy
 (`Xenova/clip-vit-base-patch32`), run with Microsoft's ONNX Runtime (MIT license) on 3 of the processor's cores. The

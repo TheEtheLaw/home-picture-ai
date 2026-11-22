@@ -10,16 +10,22 @@ usually does, which the TV keeps). Since 1.2.0 a TV can ask it to read the lette
 logo's spot, a few pictures put together so what moves behind it fades): PaddleOCR's PP-OCRv4 models (Apache-2.0,
 RapidOCR's ONNX copies, in its package at a fixed version, each model checked by its SHA-256) find its lines of letters
 and read them, so the TV can tell the channel's own logo (it spells the channel's name) from other marks that don't
-move. Nothing leaves the home network: the pictures are looked at and forgotten, never kept or logged. Announced on
-the network (mDNS, _homeai._tcp) so the TVs find it.
+move. Since 1.3.0 it remembers the ads the TVs have seen: once a TV's ad screen has covered a break, the TV sends
+the AI's fingerprints of the ads in it (512 numbers each, never a picture), each is kept once, and every answer says
+how like the nearest remembered ad the picture is, so an ad seen before is known on any channel and either TV.
+Nothing leaves the home network: the pictures are looked at and forgotten, never kept or logged; the ads' fingerprints
+are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp) so the TVs find it.
 
     POST /look[?spot=x0,y0,x1,y1]   a JPEG  ->  {"model", "score", "embedding" (512 float32, base64), "ad", "like",
-                                                "sure", "ms"}, and for a spot {"spot_model", "spot", "spot_like", "spot_ms"}
+                                                "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
+                                                "spot_ms"}
+    POST /ads                       {"model", "ads": [[scale, 512 int8 (base64)], ...]}  ->  {"new", "again", "ads"}
     POST /read                      a PNG or JPEG (a logo's spot)  ->  {"read_model", "lines" [{"text", "score"}],
                                                 "read_ms"}
     GET  /status                            ->  {"model", "version", "ready", "note", "looks", "ms", "up", "spot_model",
                                                 "spot_ready", "spot_note", "spot_looks", "spot_ms", "read_model",
-                                                "read_ready", "read_note", "reads", "read_ms"}
+                                                "read_ready", "read_note", "reads", "read_ms", "ads",
+                                                "ads_note"}
 """
 import base64
 import concurrent.futures
@@ -39,7 +45,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -77,6 +83,25 @@ READ_FILES = {'det': ('ch_PP-OCRv4_det_infer.onnx', 'd2a7720d45a54257208b1e13e36
 READ_PIXELS = 2_600_000  # a logo's spot: up to about 1600x1600
 READ_SIDE = 256          # the spot is looked for letters with its longer side this long
 READ_LINE_H = 48         # each line is read this high
+# The ads the TVs have seen (1.3.0): each kept once (a fingerprint ADS_SAME or more like a kept one is that one, seen
+# again), with no limit but a ceiling it would take decades of watching to reach (ADS_CEILING: then the ones seen
+# longest ago go, down to 99% of it); a TV sends at most ADS_BATCH at a time (a break's worth is about a hundred). On his recordings the
+# same ad came back at 0.95 or more, and no picture of the program came within 0.93 of an ad. From ADS_INDEX_FROM ads
+# on they're sorted into ADS_GROUPS groups by how they look (an index, made again when they've grown sixteenfold), so
+# each picture is compared only with the ads in the ADS_PROBE groups nearest it: as quick with a million as with a
+# thousand. New ones go on the end of a log (ads.log), folded into the main file (ads.npz) when the log passes
+# ADS_LOG_MAX or the app starts, so a break's ads never rewrite the whole memory.
+ADS_FILE = os.path.join(DATA, 'ads.npz')
+ADS_LOG = os.path.join(DATA, 'ads.log')
+ADS_SAME = 0.95
+ADS_CEILING = 2_000_000
+ADS_BATCH = 600
+ADS_INDEX_FROM = 8_192
+ADS_GROUPS = 1024
+ADS_PROBE = 8
+ADS_LOG_MAX = 32 << 20
+ADS_HEAD = b'HPA-ADS1'
+ADS_REC = 520  # a logged ad: its 512 numbers a byte each, its scale (float32), the day it was seen (int32)
 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
@@ -89,6 +114,323 @@ read_lock = threading.Lock()
 run_lock = threading.Lock()
 spot_lock = threading.Lock()
 spot_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+class AdMemory:
+    """The ads the TVs have seen (1.3.0): the AI's fingerprints, a byte a number with each one's scale (of length 1 as
+    kept), how many times each was seen and the day it last was, and the group it's in; kept in the app's storage
+    (ads.npz and ads.log), with the model they came from (another model's are of no use: the memory starts over)."""
+
+    def __init__(self, path, log):
+        self.path, self.logp = path, log
+        self.lock = threading.RLock()
+        self.work = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # the index and the tidying, one at a time
+        self.busy = False
+        self.note = 'none yet'
+        self._clear()
+
+    def _clear(self):
+        self.n = 0
+        self._alloc(1024)
+        self.cent = None    # the groups' centers (ADS_GROUPS x 512, length 1), once there's an index, and what all the
+        self.mu = None      # ads have in common (taken away before grouping: else a few groups would take nearly all)
+        self.order = None   # the ads indexed, by group, and where each group starts in it
+        self.starts = None
+        self.extra = None   # each group's ads since the index was made
+        self.indexed = 0
+
+    def _alloc(self, cap):
+        self.q = np.zeros((cap, 512), np.int8)
+        self.s = np.zeros(cap, np.float32)
+        self.count = np.zeros(cap, np.int32)
+        self.day = np.zeros(cap, np.int32)
+        self.cell = np.full(cap, -1, np.int32)
+
+    def _grow(self):
+        n, cap = self.n, len(self.q) * 2
+        q, s, count, day, cell = self.q, self.s, self.count, self.day, self.cell
+        self._alloc(cap)
+        self.q[:n], self.s[:n], self.count[:n], self.day[:n], self.cell[:n] = q[:n], s[:n], count[:n], day[:n], cell[:n]
+
+    @staticmethod
+    def quant(v):
+        """A fingerprint a byte a number, and the scale that makes it length 1 again."""
+        q = np.clip(np.round(v / (max(float(np.abs(v).max()), 1e-9) / 127.0)), -127, 127).astype(np.int8)
+        return q, 1.0 / max(float(np.linalg.norm(q.astype(np.float32))), 1e-9)
+
+    def _add(self, q, sc, day, count=1):
+        if self.n == len(self.q):
+            self._grow()
+        i = self.n
+        self.q[i], self.s[i], self.day[i], self.count[i] = q, sc, day, count
+        self.cell[i] = -1
+        if self.cent is not None:
+            c = int(np.argmax(self.cent @ self._apart(q.astype(np.float32) * sc)))
+            self.cell[i] = c
+            self.extra[c].append(i)
+        self.n += 1
+        return i
+
+    def _apart(self, x):
+        """Fingerprints with what all the ads have in common taken away (length 1 again): what tells them apart."""
+        y = x - self.mu
+        return y / np.maximum(np.linalg.norm(y, axis=-1, keepdims=True), 1e-9)
+
+    def _best(self, e):
+        """The remembered ad most like a fingerprint: how like (-1 with none) and which."""
+        if self.n == 0:
+            return -1.0, -1
+        if self.cent is None:  # not many yet: all of them
+            best, bi = -1.0, -1
+            for a in range(0, self.n, 16384):
+                b = min(self.n, a + 16384)
+                sims = (self.q[a:b].astype(np.float32) @ e) * self.s[a:b]
+                j = int(np.argmax(sims))
+                if sims[j] > best:
+                    best, bi = float(sims[j]), a + j
+            return best, bi
+        top = np.argpartition(-(self.cent @ self._apart(e)), ADS_PROBE)[:ADS_PROBE]
+        parts = [self.order[self.starts[c]:self.starts[c + 1]] for c in top]
+        parts += [np.array(self.extra[c], np.int64) for c in top if self.extra[c]]
+        idx = np.concatenate(parts)
+        if len(idx) == 0:
+            return -1.0, -1
+        sims = (self.q[idx].astype(np.float32) @ e) * self.s[idx]
+        j = int(np.argmax(sims))
+        return float(sims[j]), int(idx[j])
+
+    def known(self, e):
+        """How like the nearest remembered ad a fingerprint is (0 with none)."""
+        with self.lock:
+            return max(0.0, self._best(e)[0])
+
+    def learn(self, vs, today):
+        """A break's ads from a TV: each new one kept (on the end of the log), each one seen before counted again."""
+        new = again = 0
+        recs = []
+        with self.lock:
+            first = self.n
+            for v in vs:
+                sim, i = self._best(v)
+                if i >= 0 and sim >= ADS_SAME:
+                    self.count[i] += 1
+                    self.day[i] = today
+                    again += 1
+                    continue
+                q, sc = self.quant(v)
+                self._add(q, sc, today)
+                recs.append(q.tobytes() + np.array([sc], '<f4').tobytes() + np.array([today], '<i4').tobytes())
+                new += 1
+            if recs:
+                self._log(recs, first)
+            self.note = '%d ads' % self.n
+            self._next()
+            return new, again, self.n
+
+    def _log(self, recs, first):
+        with open(self.logp, 'ab') as f:
+            if f.tell() == 0:
+                f.write(b'%s %s %d\n' % (ADS_HEAD, MODEL_ID.encode(), first))
+            f.write(b''.join(recs))
+
+    def _replay(self, path):
+        """A log's ads after the main file's (a log left from a tidy that didn't finish is read first)."""
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except FileNotFoundError:
+            return 0
+        nl = data.find(b'\n')
+        head = data[:nl].split() if nl > 0 else []
+        if len(head) != 3 or head[0] != ADS_HEAD or head[1] != MODEL_ID.encode():
+            return 0
+        row, added = int(head[2]), 0
+        for a in range(nl + 1, len(data) - ADS_REC + 1, ADS_REC):  # a record cut short at the end is left out
+            if row == self.n:
+                r = data[a:a + ADS_REC]
+                self._add(np.frombuffer(r[:512], np.int8), float(np.frombuffer(r[512:516], '<f4')[0]),
+                          int(np.frombuffer(r[516:520], '<i4')[0]))
+                added += 1
+            elif row > self.n:
+                break
+            row += 1
+        return added
+
+    def load(self):
+        with self.lock:
+            logged = 0
+            try:
+                try:
+                    with np.load(self.path, allow_pickle=False) as z:
+                        if str(z['model']) != MODEL_ID:
+                            raise LookupError('another model')
+                        n = len(z['q'])
+                        self._alloc(max(1024, 2 * n))
+                        self.q[:n], self.s[:n], self.count[:n], self.day[:n] = z['q'], z['scale'], z['count'], z['day']
+                        self.n = n
+                        if len(z['cent']):
+                            self.cell[:n] = z['cell']
+                            self.mu = z['mu'].astype(np.float32)
+                            self._index_from(z['cent'].astype(np.float32), int(z['indexed']))
+                except FileNotFoundError:
+                    pass
+                logged = self._replay(self.logp + '.old') + self._replay(self.logp)
+                self.note = '%d ads' % self.n
+            except LookupError:
+                self._clear()
+                self._drop_logs()
+                self.note = 'started over (its ads were seen by another model)'
+            except Exception as e:
+                self._clear()
+                self._drop_logs()
+                self.note = "couldn't be read (%s): started over" % type(e).__name__
+            say('the ads remembered: ' + self.note + (' (%d from the log)' % logged if logged else ''))
+            if logged or os.path.exists(self.logp + '.old'):
+                self.busy = True
+                self.work.submit(self._job, self._tidy)
+            self._next()
+
+    def _drop_logs(self):
+        for p in (self.logp, self.logp + '.old'):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+
+    def _index_from(self, cent, indexed):
+        """The index from the groups' centers, for the ads already in their groups (their cells)."""
+        n = self.n
+        self.cent = cent
+        cells = self.cell[:n]
+        self.order = np.argsort(cells, kind='stable').astype(np.int64)
+        self.starts = np.searchsorted(cells[self.order], np.arange(len(cent) + 1))
+        self.extra = [[] for _ in range(len(cent))]
+        self.indexed = indexed
+        for i in range(n):  # any not in a group yet (none, as kept)
+            if cells[i] < 0:
+                c = int(np.argmax(cent @ self._apart(self.q[i].astype(np.float32) * self.s[i])))
+                self.cell[i] = c
+                self.extra[c].append(i)
+
+    def _next(self):
+        """The index made (again) or the log folded in, when it's time (in the background, one at a time)."""
+        if self.busy:
+            return
+        if self.n >= ADS_INDEX_FROM and (self.cent is None or self.n >= 16 * self.indexed):
+            self.busy = True
+            self.work.submit(self._job, self._index)
+        elif self.n >= ADS_CEILING or (os.path.exists(self.logp) and os.path.getsize(self.logp) > ADS_LOG_MAX):
+            self.busy = True
+            self.work.submit(self._job, self._tidy)
+
+    def _job(self, f):
+        try:
+            f()
+        except Exception as e:
+            say("the ads' memory: %s didn't finish (%s)" % (f.__name__.strip('_'), type(e).__name__))
+        finally:
+            with self.lock:
+                self.busy = False
+                self._next()
+
+    def _index(self):
+        """The ads sorted into groups by how they look (k-means on up to 16 ads a group, then every ad to its nearest)."""
+        with self.lock:
+            n0, q, s = self.n, self.q, self.s  # the first n0 don't change while this runs (only a tidy changes them)
+        t0 = time.time()
+        k = ADS_GROUPS
+        rng = np.random.default_rng(n0)
+        pick = np.sort(rng.choice(n0, size=min(n0, 16 * k), replace=False))
+        x = q[pick].astype(np.float32) * s[pick, None]
+        mu = x.mean(axis=0)
+        x = x - mu
+        x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-9)
+        cent = x[rng.choice(len(x), size=k, replace=False)].copy()
+        for _ in range(6):
+            a = self._nearest(x, cent)
+            counts = np.bincount(a, minlength=k)
+            order = np.argsort(a, kind='stable')
+            full = counts > 0
+            sums = np.zeros_like(cent)
+            sums[full] = np.add.reduceat(x[order], np.concatenate([[0], np.cumsum(counts)[:-1]])[full], axis=0)
+            sums[~full] = x[rng.choice(len(x), size=int((~full).sum()))]
+            cent = sums / np.maximum(np.linalg.norm(sums, axis=1, keepdims=True), 1e-9)
+        cells = np.empty(n0, np.int32)
+        for a0 in range(0, n0, 8192):
+            b0 = min(n0, a0 + 8192)
+            y = q[a0:b0].astype(np.float32) * s[a0:b0, None] - mu
+            cells[a0:b0] = self._nearest(y / np.maximum(np.linalg.norm(y, axis=1, keepdims=True), 1e-9), cent)
+        with self.lock:
+            self.cell[:n0] = cells
+            self.cell[n0:self.n] = -1
+            self.mu = mu.astype(np.float32)
+            self._index_from(cent.astype(np.float32), n0)
+        say("the ads' memory: indexed %d ads in %d groups (%.0f s)" % (n0, k, time.time() - t0))
+        self._tidy()
+
+    @staticmethod
+    def _nearest(x, cent):
+        out = np.empty(len(x), np.int32)
+        for a in range(0, len(x), 4096):
+            out[a:a + 4096] = np.argmax(x[a:a + 4096] @ cent.T, axis=1)
+        return out
+
+    def _tidy(self):
+        """The log folded into the main file: what's remembered now written whole (from a copy, while it goes on
+        answering), then the log that was folded in let go. At the ceiling, the ones seen longest ago go first (down to
+        99% of it)."""
+        with self.lock:
+            if self.n >= ADS_CEILING:  # down to 99% of it, the ones seen longest ago (of those, the fewest times) gone
+                n = self.n
+                keep = np.sort(np.lexsort((self.count[:n], self.day[:n]))[n - int(ADS_CEILING * 0.99):])
+                kept = [a[keep] for a in (self.q, self.s, self.count, self.day, self.cell)]
+                cent, mu, indexed = self.cent, self.mu, self.indexed
+                self._clear()
+                self._alloc(max(1024, 2 * len(keep)))
+                self.n = len(keep)
+                self.q[:self.n], self.s[:self.n], self.count[:self.n], self.day[:self.n], self.cell[:self.n] = kept
+                if cent is not None:
+                    self.mu = mu
+                    self._index_from(cent, indexed)  # the groups stay as they were
+                self._drop_logs()  # its rows are numbered anew: the file below has them all
+            n = self.n
+            snap = {'model': np.array(MODEL_ID), 'q': self.q[:n].copy(), 'scale': self.s[:n].copy(),
+                    'count': self.count[:n].copy(), 'day': self.day[:n].copy(), 'cell': self.cell[:n].copy(),
+                    'cent': self.cent.copy() if self.cent is not None else np.zeros((0, 512), np.float32),
+                    'mu': self.mu.copy() if self.mu is not None else np.zeros(512, np.float32),
+                    'indexed': np.array(self.indexed)}
+            if os.path.exists(self.logp):
+                os.replace(self.logp, self.logp + '.old')  # new ones go to a fresh log meanwhile
+        tmp = self.path + '.tmp'
+        with open(tmp, 'wb') as f:
+            np.savez(f, **snap)
+        os.replace(tmp, self.path)
+        try:
+            os.remove(self.logp + '.old')
+        except FileNotFoundError:
+            pass
+
+
+ads = AdMemory(ADS_FILE, ADS_LOG)
+
+
+def learn_ads(body):
+    """POST /ads: {"model", "ads": [[scale, 512 int8 (base64)], ...]}."""
+    j = json.loads(body)
+    if j.get('model') != MODEL_ID:
+        raise LookupError('another model')
+    vs = []
+    for item in (j.get('ads') or [])[:ADS_BATCH]:
+        scale, b64 = float(item[0]), item[1]
+        q = np.frombuffer(base64.b64decode(b64), np.int8)
+        if len(q) != 512 or not np.isfinite(scale) or scale <= 0:
+            raise ValueError('not a fingerprint')
+        v = q.astype(np.float32) * scale
+        n = np.linalg.norm(v)
+        if n > 0:
+            vs.append(v / n)
+    new, again, total = ads.learn(vs, int(time.time() // 86400))
+    return {'new': new, 'again': again, 'ads': total}
 
 
 def say(s):
@@ -369,7 +711,7 @@ def look(jpeg, box=None):
     state['looks'] += 1
     state['ms'] = ms if state['looks'] == 1 else state['ms'] * 0.95 + ms * 0.05
     out = {'model': MODEL_ID, 'score': float(e @ direction), 'ad': AD, 'like': LIKE, 'sure': SURE, 'ms': round(ms),
-           'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
+           'known': round(ads.known(e), 4), 'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
     if spot is not None:
         try:
             out.update(spot.result(timeout=5))
@@ -405,13 +747,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     'ms': round(state['ms']), 'up': round(time.time() - state['since']), 'spot_model': SPOT_ID,
                                     'spot_ready': state['spot_ready'], 'spot_note': state['spot_note'], 'spot_looks': state['spot_looks'],
                                     'spot_ms': round(state['spot_ms']), 'read_model': READ_ID, 'read_ready': state['read_ready'],
-                                    'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms'])})
-        self.reply(404, {'note': 'GET /status, POST /look or POST /read'})
+                                    'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms']),
+                                    'ads': ads.n, 'ads_note': ads.note})
+        self.reply(404, {'note': 'GET /status, POST /look, POST /read or POST /ads'})
 
     def do_POST(self):
         if not home_network(self.client_address[0]):
             return self.reply(403, {'note': 'home network only'})
         path, _, query = self.path.partition('?')
+        if path == '/ads':
+            n = int(self.headers.get('Content-Length') or 0)
+            if n <= 0 or n > 1_000_000:
+                return self.reply(400, {'note': "a break's ads, up to 1 MB"})
+            body = self.rfile.read(n)
+            try:
+                return self.reply(200, learn_ads(body))
+            except LookupError:
+                return self.reply(409, {'note': 'these were seen by another model (this one is %s)' % MODEL_ID})
+            except Exception as e:
+                return self.reply(400, {'note': 'not ads it could keep (%s)' % type(e).__name__})
         if path == '/read':
             n = int(self.headers.get('Content-Length') or 0)
             if n <= 0 or n > 4_000_000:
@@ -424,7 +778,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
         if path != '/look':
-            return self.reply(404, {'note': 'POST /look or POST /read'})
+            return self.reply(404, {'note': 'POST /look, POST /read or POST /ads'})
         box = None
         for kv in query.split('&'):
             if kv.startswith('spot='):
@@ -489,6 +843,7 @@ def main():
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     say('Home picture AI %s, answering on port %d' % (VERSION, PORT))
+    ads.load()
     threading.Thread(target=announce, daemon=True).start()
     wait = 30
     while True:  # never gives up: a problem is said in the log and tried again, later each time

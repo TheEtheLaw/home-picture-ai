@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0
+
+- Remembers the ads the TVs have seen: once a TV's ad screen has covered a break, the TV sends the AI's fingerprints
+  of its ads (`POST /ads`, 512 numbers each, never a picture), and each ad is kept once, with no limit. Every answer
+  to `POST /look` now says how like the nearest remembered ad the picture is (`known`), so an ad seen before is known
+  right away, on any channel and by either TV, whatever the picture's lean.
+- Grouped by how they look once there are 8,192, so finding one stays quick however many there are (a million: a few
+  thousandths of a second). New ones go on the end of a log, so a break's ads never rewrite the whole memory. A
+  ceiling of 2 million (decades of watching) keeps it from filling the storage.
+- Kept in the app's own storage (`ads.npz`, `ads.log`: about half a kilobyte an ad) and in Home Assistant's backups;
+  nothing to download. `GET /status` says how many it remembers (`ads`, `ads_note`).
+
 ## 1.2.0
 
 - Reads a logo's letters: a TV can send the spot where it found a mark that doesn't move (`POST /read`, a PNG or
