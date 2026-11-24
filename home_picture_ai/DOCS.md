@@ -45,13 +45,16 @@ over.
 - `POST /read` with a PNG or JPEG of a logo's spot (since 1.2.0): `{"read_model", "lines", "read_ms"}`, where
   `lines` are the logo's lines of letters, top to bottom, each `{"text", "score"}`. The TV sends a few pictures of the
   spot put together (so what moves behind the logo fades) and checks the letters against the channel's name.
+- `POST /read?side=N` with a PNG or JPEG of a whole picture (since 1.4.0): the same answer, with the letters looked for
+  at the picture's longer side N (256 to 1280, in steps of 32; `side` in the answer says which). A TV sends a 960x540
+  picture at 768 near the end of an episode or a film, and knows the credits by their words. Without `side`, 256.
 - `POST /ads` (since 1.3.0) with `{"model", "ads": [[scale, fingerprint], ...]}`, each fingerprint 512 numbers of a
   byte each (base64), times its scale: a covered break's ads, at most 600 at a time. Answers `{"new", "again",
   "ads"}`: how many were new, how many were seen before, and how many it remembers now. Fingerprints from another
   model are turned away (409).
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
-  "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms", "ads",
-  "ads_note"}`.
+  "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms", "read_side_max",
+  "ads", "ads_note"}`. `read_side_max` (since 1.4.0): the largest `side` a TV can ask for.
 
 The main model is the picture half of OpenAI's CLIP ViT-B/32 (MIT license), from Xenova's ONNX copy
 (`Xenova/clip-vit-base-patch32`), run with Microsoft's ONNX Runtime (MIT license) on 3 of the processor's cores. The

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- Reads a whole picture too, for the credits: a TV can send a whole frame (`POST /read?side=N`, a PNG or JPEG) and
+  the same PP-OCRv4 models look for its lines of letters with the picture's longer side up to N points (256 to 1280,
+  in steps of 32). A TV sends a 960x540 picture at 768 near the end of an episode or a film, a few seconds apart, and
+  knows the credits by their words ("Directed by", "Executive Producer", the copyright line), even over a scene.
+- A logo's spot is read as before (no `side`: 256). Every answer says the side it used (`side`), and `GET /status`
+  says the largest a TV can ask for (`read_side_max`), so a TV knows this version can read whole pictures.
+- Nothing more to download: the same two models, on one core for a moment when a TV asks.
+
 ## 1.3.0
 
 - Remembers the ads the TVs have seen: once a TV's ad screen has covered a break, the TV sends the AI's fingerprints

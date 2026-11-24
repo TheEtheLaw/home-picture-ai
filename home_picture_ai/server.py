@@ -10,7 +10,9 @@ usually does, which the TV keeps). Since 1.2.0 a TV can ask it to read the lette
 logo's spot, a few pictures put together so what moves behind it fades): PaddleOCR's PP-OCRv4 models (Apache-2.0,
 RapidOCR's ONNX copies, in its package at a fixed version, each model checked by its SHA-256) find its lines of letters
 and read them, so the TV can tell the channel's own logo (it spells the channel's name) from other marks that don't
-move. Since 1.3.0 it remembers the ads the TVs have seen: once a TV's ad screen has covered a break, the TV sends
+move. Since 1.4.0 it can read a whole picture too (`side`: the letters looked for with the picture's longer side up to
+1280 points instead of a logo's 256), so a TV can ask what a picture says, like a film's end credits. Since 1.3.0 it
+remembers the ads the TVs have seen: once a TV's ad screen has covered a break, the TV sends
 the AI's fingerprints of the ads in it (512 numbers each, never a picture), each is kept once, and every answer says
 how like the nearest remembered ad the picture is, so an ad seen before is known on any channel and either TV.
 Nothing leaves the home network: the pictures are looked at and forgotten, never kept or logged; the ads' fingerprints
@@ -20,11 +22,12 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
                                                 "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
                                                 "spot_ms"}
     POST /ads                       {"model", "ads": [[scale, 512 int8 (base64)], ...]}  ->  {"new", "again", "ads"}
-    POST /read                      a PNG or JPEG (a logo's spot)  ->  {"read_model", "lines" [{"text", "score"}],
-                                                "read_ms"}
+    POST /read[?side=N]             a PNG or JPEG (a logo's spot; with side, a whole picture looked at with its longer
+                                                side N, 256 to 1280)  ->  {"read_model", "lines" [{"text", "score"}],
+                                                "read_ms", "side"}
     GET  /status                            ->  {"model", "version", "ready", "note", "looks", "ms", "up", "spot_model",
                                                 "spot_ready", "spot_note", "spot_looks", "spot_ms", "read_model",
-                                                "read_ready", "read_note", "reads", "read_ms", "ads",
+                                                "read_ready", "read_note", "reads", "read_ms", "read_side_max", "ads",
                                                 "ads_note"}
 """
 import base64
@@ -45,7 +48,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -82,6 +85,7 @@ READ_FILES = {'det': ('ch_PP-OCRv4_det_infer.onnx', 'd2a7720d45a54257208b1e13e36
               'rec': ('ch_PP-OCRv4_rec_infer.onnx', '48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b')}
 READ_PIXELS = 2_600_000  # a logo's spot: up to about 1600x1600
 READ_SIDE = 256          # the spot is looked for letters with its longer side this long
+READ_SIDE_MAX = 1280     # a whole picture (?side=): up to this long (a TV's 960x540 picture, its credits' letters)
 READ_LINE_H = 48         # each line is read this high
 # The ads the TVs have seen (1.3.0): each kept once (a fingerprint ADS_SAME or more like a kept one is that one, seen
 # again), with no limit but a ceiling it would take decades of watching to reach (ADS_CEILING: then the ones seen
@@ -538,10 +542,10 @@ class Reader:
         chars = self.rec.get_modelmeta().custom_metadata_map['character'].splitlines()
         self.chars = [''] + chars + [' ']
 
-    def read(self, im):
+    def read(self, im, side=READ_SIDE):
         rgb = im.convert('RGB')
         w, h = rgb.size
-        k = READ_SIDE / max(w, h)
+        k = side / max(w, h)
         dw, dh = max(32, int(round(w * k / 32)) * 32), max(32, int(round(h * k / 32)) * 32)
         x = (np.asarray(rgb.resize((dw, dh), Image.BICUBIC), np.float32) / 255.0 - 0.5) / 0.5
         prob = self.det.run(None, {'x': x.transpose(2, 0, 1)[None]})[0][0, 0]
@@ -631,17 +635,30 @@ def load_read():
     return True
 
 
-def read_logo(data):
+def read_side(query):
+    """The longer side a picture is looked at with: a logo's (256), or ?side=N for a whole picture (256 to 1280, in steps
+    of 32)."""
+    for kv in query.split('&'):
+        if kv.startswith('side='):
+            try:
+                n = int(kv[5:])
+            except ValueError:
+                raise ValueError('side')
+            return max(READ_SIDE, min(READ_SIDE_MAX, int(round(n / 32)) * 32))
+    return READ_SIDE
+
+
+def read_logo(data, side=READ_SIDE):
     im = Image.open(io.BytesIO(data))
     if im.width * im.height > READ_PIXELS or min(im.width, im.height) < 8:
         raise ValueError('size')
     t0 = time.time()
     with read_lock:
-        lines = reader.read(im)
+        lines = reader.read(im, side)
     ms = (time.time() - t0) * 1000
     state['reads'] += 1
     state['read_ms'] = ms if state['reads'] == 1 else state['read_ms'] * 0.9 + ms * 0.1
-    return {'read_model': READ_ID, 'lines': lines, 'read_ms': round(ms)}
+    return {'read_model': READ_ID, 'lines': lines, 'read_ms': round(ms), 'side': side}
 
 
 def axis(n_in):
@@ -748,7 +765,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     'spot_ready': state['spot_ready'], 'spot_note': state['spot_note'], 'spot_looks': state['spot_looks'],
                                     'spot_ms': round(state['spot_ms']), 'read_model': READ_ID, 'read_ready': state['read_ready'],
                                     'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms']),
-                                    'ads': ads.n, 'ads_note': ads.note})
+                                    'read_side_max': READ_SIDE_MAX, 'ads': ads.n, 'ads_note': ads.note})
         self.reply(404, {'note': 'GET /status, POST /look, POST /read or POST /ads'})
 
     def do_POST(self):
@@ -774,7 +791,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not state['read_ready']:
                 return self.reply(503, {'note': state['read_note']})
             try:
-                return self.reply(200, read_logo(body))
+                side = read_side(query)
+            except ValueError:
+                return self.reply(400, {'note': 'side: a number of points, 256 to 1280'})
+            try:
+                return self.reply(200, read_logo(body, side))
             except Exception as e:
                 return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
         if path != '/look':
