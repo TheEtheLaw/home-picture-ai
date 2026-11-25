@@ -1,0 +1,11 @@
+configuration:
+  format_new_drive:
+    name: Format a new drive
+    description: >-
+      On the next start, erase the drive if it isn't this app's yet and format it for the app. It turns itself off
+      once it has formatted one.
+  keep_days:
+    name: Days to keep
+    description: >-
+      A file that hasn't been watched (the next episode, or one stopped partway) goes once nobody has played it for
+      this many days.
