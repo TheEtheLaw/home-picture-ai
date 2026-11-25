@@ -18,12 +18,13 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -31,7 +32,6 @@ MOUNT = TEST_ROOT or '/mnt/homemedia'
 DIR = os.path.join(MOUNT, 'home-media')
 DATA = os.environ.get('HOME_MEDIA_DATA', '/data')
 OPTIONS = os.path.join(DATA, 'options.json')
-STATE = os.path.join(DATA, 'state.json')
 CHUNK = 1 << 20            # the drive keeps track of what's in a mebibyte at a time
 BLOCK = 256 << 10          # read and written in quarter mebibytes
 AHEAD = 32 << 20           # a part wanted this close ahead of the download comes soon enough: no jump
@@ -101,41 +101,68 @@ class Drive:
         self.why = 'a test folder' if TEST_ROOT else 'not looked at yet'
         self.model = ''
         self.lock = threading.Lock()
+        self.formatted = set()  # drives formatted since the app started (its settings file is rewritten only on a start)
 
     def disks(self):
-        code, out = run(['lsblk', '-J', '-b', '-o', 'NAME,PATH,TYPE,SIZE,TRAN,MODEL,SERIAL,LABEL,FSTYPE'], 60)
+        """The Pi's drives, from the kernel. Each part's filesystem, label and name are read off the drive itself: the
+        app has no copy of the Pi's device database, so lsblk alone doesn't know them."""
+        code, out = run(['lsblk', '-J', '-b', '-o', 'NAME,PATH,TYPE,SIZE,TRAN,MODEL,SERIAL'], 60)
         if code != 0:
             raise RuntimeError('lsblk: ' + out[:200])
-        return json.loads(out).get('blockdevices', [])
+        disks = json.loads(out).get('blockdevices', [])
+        for d in disks:
+            if not self.skipped(d):
+                for p in self.parts(d):
+                    p.update(self.probe(p.get('path')))
+        return disks
 
     @staticmethod
-    def node(dev):
-        """Its device file, made if the drive came after the app started (the app sees the Pi's devices as they were)."""
-        path, name = dev.get('path') or '', dev.get('name') or ''
-        if not path or os.path.exists(path):
-            return path
-        try:
-            with open('/sys/class/block/%s/dev' % name) as f:
-                major, minor = f.read().strip().split(':')
-            os.mknod(path, 0o660 | 0o060000, os.makedev(int(major), int(minor)))
-        except Exception as e:
-            say('the drive\'s device file couldn\'t be made (%s)' % type(e).__name__)
-        return path
+    def probe(path):
+        found = {'fstype': '', 'label': '', 'partname': ''}
+        if path:
+            code, out = run(['blkid', '-p', '-o', 'export', path], 60)
+            names = {'TYPE': 'fstype', 'LABEL': 'label', 'PART_ENTRY_NAME': 'partname'}
+            for line in out.splitlines():
+                key, _, value = line.partition('=')
+                if key in names:
+                    found[names[key]] = value.replace('\\ ', ' ')
+        return found
 
     @staticmethod
     def parts(d):
         return [d] + [c for c in d.get('children') or []]
 
     @staticmethod
+    def skipped(d):
+        """The Pi's own kinds of storage: the SD card, memory, loop devices, an NVMe drive."""
+        return (d.get('name') or '').startswith(('mmcblk', 'zram', 'loop', 'ram', 'nvme'))
+
+    @staticmethod
     def system(d):
-        """Home Assistant's own disk (its hassos partitions), the SD card, and the like: never touched."""
-        name = d.get('name') or ''
-        if name.startswith(('mmcblk', 'zram', 'loop', 'ram', 'nvme')):
+        """Home Assistant's own disk (its hassos parts, also when it starts from a USB drive), the SD card, and the
+        like: never touched."""
+        if Drive.skipped(d):
             return True
-        for p in Drive.parts(d):
-            if (p.get('label') or '').lower().startswith('hassos'):
-                return True
-        return False
+        return any((p.get(k) or '').lower().startswith('hassos') for p in Drive.parts(d) for k in ('label', 'partname'))
+
+    @staticmethod
+    def in_use(path):
+        """Why the drive can't be had for itself, or None: the kernel refuses this when any part of it is in use on the
+        Pi (as Home Assistant's own disk always is)."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_EXCL)
+        except OSError as e:
+            return (e.strerror or type(e).__name__).lower()
+        os.close(fd)
+        return None
+
+    @staticmethod
+    def what(d):
+        return '%s, %s' % ((d.get('model') or d.get('name') or '?').strip(), size_text(int(d.get('size') or 0)))
+
+    @staticmethod
+    def key(d):
+        return '%s %s %s' % (d.get('path'), d.get('size'), (d.get('serial') or '').strip())
 
     def look(self):
         """Finds and mounts the drive (formatting a new one once, if the option says so). True if it's ready."""
@@ -161,27 +188,30 @@ class Drive:
                     return self.fail('no drive: plug it into the hub (on one of the Pi\'s blue USB 3 ports)')
                 if len(usb) > 1:
                     return self.fail('more than one drive (%s): only the media drive should be plugged in'
-                                     % ', '.join((d.get('model') or d.get('name') or '?').strip() for d in usb))
+                                     % ', '.join(self.what(d) for d in usb))
                 d = usb[0]
+                if self.key(d) in self.formatted:
+                    return self.fail('the drive was formatted, but it doesn\'t read as this app\'s (%s)' % self.what(d))
                 if not options().get('format_new_drive', False):
-                    return self.fail('a drive is there (%s, %s) but it isn\'t formatted for this app: turn on '
-                                     '"Format a new drive" in the app\'s settings' % ((d.get('model') or '').strip(), size_text(int(d.get('size') or 0))))
-                state = load_json(STATE, {})
-                if state.get('formatted'):
-                    return self.fail('a new drive is there, but this app formatted one before: turn "Format a new drive" '
-                                     'off and on again to format this one too')
+                    return self.fail('a drive is there (%s) but it isn\'t formatted for this app: turn on '
+                                     '"Format a new drive" in the app\'s settings' % self.what(d))
                 if int(d.get('size') or 0) < MIN_DRIVE:
-                    return self.fail('the drive is too small for media (%s)' % size_text(int(d.get('size') or 0)))
+                    return self.fail('the drive is too small for media (%s)' % self.what(d))
+                busy = self.in_use(d.get('path'))
+                if busy:
+                    return self.fail('the drive (%s) is in use on the Pi (%s): it isn\'t formatted' % (self.what(d), busy))
                 if not self.format(d):
                     return False
                 ours = (d, {'path': d.get('path'), 'label': LABEL, 'fstype': 'ext4'})
             d, p = ours
+            if p is d and d.get('children'):
+                run(['blockdev', '--rereadpt', d.get('path')], 60)  # parts the kernel still lists from before
             os.makedirs(MOUNT, exist_ok=True)
-            code, out = run(['mount', '-t', 'ext4', '-o', 'noatime', self.node(p), MOUNT], 120)
+            code, out = run(['mount', '-t', 'ext4', '-o', 'noatime', p.get('path'), MOUNT], 120)
             if code != 0:
-                return self.fail('the drive couldn\'t be mounted (%s)' % out[:200])
+                return self.fail('the drive couldn\'t be mounted (%s)' % ' '.join(out.split())[:200])
             os.makedirs(DIR, exist_ok=True)
-            self.model = ((d.get('model') or '').strip() + ' ' + size_text(int(d.get('size') or 0))).strip()
+            self.model = self.what(d)
             self.ok = True
             self.why = 'ready'
             st = os.statvfs(MOUNT)
@@ -190,19 +220,17 @@ class Drive:
 
     def format(self, d):
         """Formats the whole drive for this app (ext4, HOMEMEDIA): once, and only when the app's setting says so."""
-        path = self.node(d)
-        say('formatting the new drive (%s, %s) for this app: everything on it goes' % ((d.get('model') or '').strip(), size_text(int(d.get('size') or 0))))
-        for p in reversed(self.parts(d)):
-            run(['umount', '-l', p.get('path')], 60)
+        path = d.get('path')
+        say('formatting the new drive (%s) for this app: everything on it goes' % self.what(d))
         code, out = run(['wipefs', '-a', '-f', path], 120)
         if code != 0:
             return self.fail('the drive couldn\'t be cleared (%s)' % out[:200])
+        run(['blockdev', '--rereadpt', path], 60)  # the kernel forgets the parts that were on it
         code, out = run(['mkfs.ext4', '-F', '-L', LABEL, '-m', '0', '-T', 'largefile4',
                          '-E', 'lazy_itable_init=1,lazy_journal_init=1', path], 1800)
         if code != 0:
             return self.fail('the drive couldn\'t be formatted (%s)' % out[-200:])
-        save_json(STATE, {'formatted': {'model': (d.get('model') or '').strip(), 'serial': (d.get('serial') or '').strip(),
-                                        'size': int(d.get('size') or 0), 'at': int(time.time())}})
+        self.formatted.add(self.key(d))
         set_option('format_new_drive', False)
         say('the drive is formatted (ext4, labelled %s)' % LABEL)
         return True
@@ -868,9 +896,18 @@ def announce():
         time.sleep(60)
 
 
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """A device hanging up partway (the watchdog does, after its check) isn't news; anything else, said briefly."""
+        e = sys.exc_info()[1]
+        if not isinstance(e, (ConnectionError, TimeoutError)):
+            say('a request failed (%s)' % type(e).__name__)
+
+
 def main():
-    srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
-    srv.daemon_threads = True
+    srv = Server(('0.0.0.0', PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     say('Home media %s, answering on port %d' % (VERSION, PORT))
     if not TEST_ROOT:

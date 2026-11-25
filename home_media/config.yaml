@@ -1,5 +1,5 @@
 name: Home media
-version: "1.0.0"
+version: "1.0.1"
 slug: home_media
 description: Downloads what Home plays onto its own USB drive and plays it to the TVs from there, so every jump is instant.
 url: https://github.com/TheEtheLaw/home-picture-ai
@@ -10,6 +10,8 @@ startup: application
 boot: auto
 host_network: true
 full_access: true
+privileged:
+  - SYS_ADMIN
 apparmor: false
 hassio_api: true
 watchdog: "http://[HOST]:[PORT:8766]/status"

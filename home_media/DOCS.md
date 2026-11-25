@@ -10,15 +10,15 @@ first, then it fills in the rest. While one plays, the next episode can come in 
 1. Plug the drive into a powered USB hub, and the hub into one of the Pi's blue USB 3 ports. Only the media drive
    should be plugged in when the app first starts.
 2. Install **Home media**, then turn **Protection mode** off on its page: using a drive needs full access to the
-   Pi's hardware. It only applies to this app.
+   Pi's hardware, and the right to mount it (the app asks for that). It only applies to this app.
 3. **Start** it, and keep **Start on boot** and **Watchdog** on.
 
 On its first start the app formats the drive for itself (Linux's ext4, named `HOMEMEDIA`): **everything on the drive
 is erased**. It does this once: the **Format a new drive** setting turns itself off afterwards. To format another
 drive later (a replacement), turn the setting on again.
 
-The app never touches Home Assistant's own disk or the Pi's SD card, never formats a drive under 100 GB, and never
-formats when more than one drive is plugged in. The drive is mounted inside this app only. Unplugged, the app says so
+The app never touches Home Assistant's own disk or the Pi's SD card, never formats a drive under 100 GB or one in use
+on the Pi, and never formats when more than one drive is plugged in. The drive is mounted inside this app only. Unplugged, the app says so
 in its log and writes nothing anywhere; the TVs play from the source as before until it's back.
 
 ## Settings
