@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -335,6 +335,7 @@ class Item:
         self.saved_at = 0
         self.save_lock = threading.Lock()
         self.gone = False
+        self.dropped = False        # not wanted any more (another copy was picked): its download stops
 
     def data(self):
         return os.path.join(DIR, self.id + '.data')
@@ -418,6 +419,9 @@ class Item:
         backoff = 5
         at = None
         while not self.gone:
+            if self.dropped:
+                self.state = 'not wanted'
+                return
             with self.cond:
                 pos = self.next_pos(at)
                 if pos is None:
@@ -503,6 +507,11 @@ class Item:
                     if self.ranges and self.jump_wanted(off):
                         say('%s: a jump to %s: the download goes there first' % (self.name, size_text(self.want)))
                         return None
+                    if self.dropped:
+                        return off
+                    if self.prefetch and self.ranges and others_busy(self):
+                        say('%s: one being played started coming in: this one (ahead of time) waits for it' % self.name)
+                        return off  # one connection at a time: it goes on from here once that one is all in
                     end = min((c + 1) * CHUNK, self.size)
                     while off < end:
                         b = resp.read(min(BLOCK, end - off))
@@ -652,7 +661,9 @@ def get(body):
         hdrs = body.get('headers') or {}
         it.headers = {str(k): str(v) for k, v in hdrs.items() if str(k).lower() in ('user-agent', 'referer', 'cookie', 'authorization')}
         it.last_used = time.time()
-        it.watched = False
+        it.watched = it.dropped = False
+        if it.state in ('waiting for its link', 'not wanted'):
+            it.state = 'starting'  # its fresh link: the download picks it up at once
         it.cond.notify_all()
     it.start()
     it.save(True)
@@ -660,15 +671,28 @@ def get(body):
 
 
 def done(body):
-    """He watched it (POST /done): it goes, once no TV is reading it."""
+    """He watched it (POST /done): it goes, once no TV is reading it. With "why": "dropped", it isn't wanted any more
+    (another copy was picked, or it plays straight from the source now): its download stops at once, and it goes at once
+    when no TV is reading it."""
     iid = str(body.get('id') or '') or (item_id(str(body.get('key'))) if body.get('key') else '')
     with items_lock:
         it = items.get(iid)
     if not it:
         return {'ok': False}
     it.watched = True
+    if body.get('why') == 'dropped':
+        with it.cond:
+            it.dropped = True
+            it.cond.notify_all()
+        if it.readers == 0:
+            forget(it, DROPPED)
+            return {'ok': True}
     it.save(True)
     return {'ok': True}
+
+
+DROPPED = 'not wanted: another copy was picked'
+
 
 
 def tidy():
@@ -683,8 +707,8 @@ def tidy():
         if it.readers > 0:
             continue
         why = None
-        if it.watched and now - it.last_used > 60:
-            why = 'watched'
+        if it.watched and (it.dropped or now - it.last_used > 60):
+            why = DROPPED if it.dropped else 'watched'
         elif now - it.last_used > keep_days * 86400:
             why = 'unused for %g days' % keep_days
         if why:

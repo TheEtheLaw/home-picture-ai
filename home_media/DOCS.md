@@ -50,5 +50,7 @@ Announced on the home network as `_homemedia._tcp`, port 8766.
 - `GET /play/<id>`: the file, with ranges (as a player asks for it). A part that isn't in yet is sent as soon as it
   comes in (the download goes there first); a TV waits at most a minute before its connection ends and it asks again.
 - `POST /done` with `{"key"}` or `{"id"}`: it's been watched; it goes within ten minutes, once no TV is reading it.
+  With `"why": "dropped"`: it isn't wanted any more (another copy was picked); its download stops at once, and it goes
+  at once when no TV is reading it.
 - `GET /status`: the drive (ready or why not, its size and free space) and the files (size, how much is in, how fast
   it's coming in, state). The watchdog uses it.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- The next episode, coming in ahead of time, hands its connection over the moment one being played starts coming in, and
+  goes on from where it was once that one is all in: one connection to the source at a time.
+- A copy Home doesn't want any more (another copy was picked, or it plays straight from the source now) stops coming in
+  at once and goes from the drive (`POST /done` with `"why": "dropped"`).
+
 ## 1.0.1
 
 - Mounts its drive: Home Assistant now lets an app mount a drive only when it asks for that right, so it asks
