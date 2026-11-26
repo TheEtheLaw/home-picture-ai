@@ -88,7 +88,8 @@ and words.
 - `POST /ads/forget` (since 1.7.0) with `{"model", "shows": [[scale, fingerprint], ...]}`: the show's own pictures (a
   TV's, the channel's logo on), each fingerprint as for `POST /ads`. Every remembered ad as like one of them as an ad
   seen again is let go (a break that wasn't one taught the memory the show). Answers `{"forgot", "ads"}`: how many
-  were let go, and how many it remembers now.
+  were let go, and how many it remembers now. Paused since 1.7.1 (nothing is let go): a channel can keep its logo on
+  through its ads.
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
   "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms", "read_side_max",
   "ads", "ads_note"}`. `read_side_max` (since 1.4.0): the largest `side` a TV can ask for.

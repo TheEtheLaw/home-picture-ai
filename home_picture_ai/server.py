@@ -65,7 +65,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.7.0'
+VERSION = '1.7.1'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -126,6 +126,10 @@ ADS_REC = 520  # a logged ad: its 512 numbers a byte each, its scale (float32), 
 # (1.7.0) The show's own pictures (a TV's, with the channel's logo on) let go of the remembered ads ADS_SAME or more like
 # them, up to ADS_FORGET_EACH a picture: a break that wasn't one (the AI taking a show for ads) taught the memory the show.
 ADS_FORGET_EACH = 32
+# (1.7.1) Paused: a channel can keep its logo on through its ads (on FS1 the logo in the bottom bar stays), so a TV's
+# "show pictures" with the logo on can be real ads; letting go waits for the TVs to know which logos really go away in
+# breaks. POST /ads/forget answers as before but lets nothing go while this is off.
+ADS_FORGET_ON = False
 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
@@ -553,7 +557,10 @@ def forget_ads(body):
     j = json.loads(body)
     if j.get('model') != MODEL_ID:
         raise LookupError('another model')
-    gone, left = ads.forget(fingerprints(j, 'shows'))
+    shows = fingerprints(j, 'shows')
+    if not ADS_FORGET_ON:
+        return {'forgot': 0, 'ads': ads.n - ads.dead, 'note': 'letting go is paused for now (1.7.1)'}
+    gone, left = ads.forget(shows)
     if gone:
         say('the ads remembered: %d let go, the show\'s own pictures from a TV (%d left)' % (gone, left))
     return {'forgot': gone, 'ads': left}

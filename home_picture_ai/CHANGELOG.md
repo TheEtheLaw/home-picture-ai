@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.1
+
+- Letting go of remembered ads (`POST /ads/forget`) is paused: a channel can keep its logo on through its ads (FS1's
+  logo in its bottom bar stays), so a TV's pictures with the logo on can be real ads, not the show. It answers as
+  before and lets nothing go, until the TVs know which logos really go away in a break.
+
 ## 1.7.0
 
 - The ads it remembers clean themselves: a TV sends the show's own pictures (ones with the channel's logo on that came
