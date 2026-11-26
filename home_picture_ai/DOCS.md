@@ -30,6 +30,17 @@ takes a few thousandths of a second longer. Every answer says how like the neare
 an ad seen before is known right away, on any channel and by either TV. A different main model starts the memory
 over.
 
+## The bench (since 1.5.0)
+
+To pick the ad AI's next model, `POST /bench` (from the home network) times bigger models on this Pi, one at a time:
+Apple's MobileCLIP2-S2, -B and -L/14 and Google's SigLIP 2 B/16 and L/16 at 256 (also 8-bit), and the two models the
+TVs use now, to compare. Each is downloaded (a fixed version from Hugging Face, checked by its SHA-256), timed on 1
+core and on 3, and deleted again; nothing is kept, and the TVs keep their models. A timing starts only once no TV has
+asked for 20 seconds, so the TVs' answers never slow down. It takes about half an hour (the downloads are about 3.7
+GB in all). `GET /bench` says how far it is: for each model its size, its time for a picture on 1 core (`ms_1`) and on
+3 (`ms_3`), how many pictures a second that is (`per_second`), its memory, and why one wasn't timed (no room, too
+little memory, a download that didn't come or didn't check out).
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how

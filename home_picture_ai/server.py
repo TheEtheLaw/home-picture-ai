@@ -28,7 +28,14 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
     GET  /status                            ->  {"model", "version", "ready", "note", "looks", "ms", "up", "spot_model",
                                                 "spot_ready", "spot_note", "spot_looks", "spot_ms", "read_model",
                                                 "read_ready", "read_note", "reads", "read_ms", "read_side_max", "ads",
-                                                "ads_note"}
+                                                "ads_note", "bench"}
+    POST /bench                             ->  starts the bench (1.5.0): bigger models timed here, one at a time
+    GET  /bench                             ->  {"state", "note", "at", "memory_mb", "models": [{"id", "what", "size_mb",
+                                                "ms_1", "ms_3", "per_second", "load_s", "memory_mb", "note"}, ...]}
+
+Since 1.5.0 it can time bigger models on this Pi, for the ad AI's next model (the bench, started from the home
+network): each is downloaded (a fixed version, checked by its SHA-256), timed on 1 core and on 3 while no TV is
+asking, and deleted again; the models the TVs use now are timed too, to compare.
 """
 import base64
 import concurrent.futures
@@ -39,6 +46,7 @@ import io
 import ipaddress
 import json
 import os
+import shutil
 import socket
 import threading
 import time
@@ -48,7 +56,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -110,7 +118,7 @@ ADS_REC = 520  # a logged ad: its 512 numbers a byte each, its scale (float32), 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
          'spot_ready': False, 'spot_note': 'waiting for the main model', 'spot_looks': 0, 'spot_ms': 0.0,
-         'read_ready': False, 'read_note': 'waiting for the other models', 'reads': 0, 'read_ms': 0.0}
+         'read_ready': False, 'read_note': 'waiting for the other models', 'reads': 0, 'read_ms': 0.0, 'last_look': 0.0}
 session = None
 spot_session = None
 reader = None
@@ -118,6 +126,38 @@ read_lock = threading.Lock()
 run_lock = threading.Lock()
 spot_lock = threading.Lock()
 spot_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+# ---- (1.5.0) The bench: how fast bigger models run on this Pi, for the ad AI's next model ----
+HF = 'https://huggingface.co/'
+MC2 = HF + 'plhery/mobileclip2-onnx/resolve/ba95759a5bdbaca53e9111e2550a76ec09c8fd9e/onnx/'
+SG2B = HF + 'onnx-community/siglip2-base-patch16-256-ONNX/resolve/d1114256522a37ffa257a0a58017348ab0058db2/onnx/'
+SG2L = HF + 'onnx-community/siglip2-large-patch16-256-ONNX/resolve/c03fb63ddd5fe363212cbd08110f92a35250db6a/onnx/'
+# (id, what, address (None: a model the TVs use now), size, SHA-256, picture side): the smallest first.
+BENCH = [
+    ('clip-vit-b32', "CLIP ViT-B/32 (the AI's now)", None, 351_685_709, None, 224),
+    ('mobileclip2-s0', "MobileCLIP2-S0 (the logo's spot now)", None, 45_555_784, None, 256),
+    ('siglip2-b16-256-int8', 'SigLIP 2 B/16, 256 (8-bit)', SG2B + 'vision_model_int8.onnx', 94_737_653,
+     '8243a496e524bf8fa19830ff42a40a4bae2e97acc2e288d4ae97601edf954977', 256),
+    ('mobileclip2-s2', 'MobileCLIP2-S2', MC2 + 's2/vision_model.onnx', 143_044_797,
+     'a841f72c5a5085748bbe271a1d5718aba877822a15cba865bdbd0d37036b849e', 256),
+    ('siglip2-l16-256-int8', 'SigLIP 2 L/16, 256 (8-bit)', SG2L + 'vision_model_int8.onnx', 319_618_816,
+     '861d6b698f7390f9d5282a91b06d745ec86fc30f13ff638da84583acc83ed2ba', 256),
+    ('mobileclip2-b', 'MobileCLIP2-B', MC2 + 'b/vision_model.onnx', 345_545_489,
+     '2f3873e400fd1adc5298b72d29e81bb69337e58601cf2853c43bc1211631eecd', 224),
+    ('siglip2-b16-256', 'SigLIP 2 B/16, 256', SG2B + 'vision_model.onnx', 371_992_072,
+     'f5cb16728a704703f05516ded628397e11dbca4de2eb5db04b0c0bcee988aa7a', 256),
+    ('mobileclip2-l14', 'MobileCLIP2-L/14', MC2 + 'l14/vision_model.onnx', 1_216_159_663,
+     'd48d4392f5805f59896009ea5460c7fa29f59722edd0d7d26c054b0980020998', 224),
+    ('siglip2-l16-256', 'SigLIP 2 L/16, 256', SG2L + 'vision_model.onnx', 1_264_345_246,
+     'a68762da4fab7335558d4713c77e42d8abe23dcd48d38b5dbe1c00765c07ca56', 256),
+]
+BENCH_RUNS = 8          # timed runs for each number (after one to warm up)
+BENCH_BUDGET = 150      # seconds at most for each number (at least 2 runs)
+BENCH_QUIET = 20        # no TV asking for this long before a timing starts
+BENCH_WAIT = 1800       # waits this long at most for that, then times anyway (and says so)
+BENCH_ROOM = 1 << 30    # storage left free besides the model
+bench = {'state': 'not run yet', 'note': '', 'at': None, 'memory_mb': None, 'models': []}
+bench_lock = threading.Lock()
 
 
 class AdMemory:
@@ -726,6 +766,7 @@ def look(jpeg, box=None):
     ms = (time.time() - t0) * 1000
     e = e / np.linalg.norm(e)
     state['looks'] += 1
+    state['last_look'] = time.time()
     state['ms'] = ms if state['looks'] == 1 else state['ms'] * 0.95 + ms * 0.05
     out = {'model': MODEL_ID, 'score': float(e @ direction), 'ad': AD, 'like': LIKE, 'sure': SURE, 'ms': round(ms),
            'known': round(ads.known(e), 4), 'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
@@ -735,6 +776,170 @@ def look(jpeg, box=None):
         except Exception:
             pass  # the main answer still counts
     return out
+
+
+def meminfo(key):
+    """A /proc/meminfo line's value in bytes (MemTotal, MemAvailable), or None."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith(key + ':'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def rss():
+    """This app's memory in use now, in bytes."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def bench_get(path, url, size, sha):
+    """A bench model downloaded and checked (a few tries); raises if it can't be."""
+    for attempt in range(3):
+        part = path + '.part'
+        try:
+            have = os.path.getsize(part) if os.path.isfile(part) else 0
+            if have > size:
+                os.remove(part)
+                have = 0
+            req = urllib.request.Request(url, headers={'User-Agent': 'home-picture-ai', **({'Range': 'bytes=%d-' % have} if have else {})})
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, 'ab' if have and r.status == 206 else 'wb') as out:
+                shutil.copyfileobj(r, out, 1 << 20)
+            if os.path.getsize(part) != size:
+                raise IOError('it ended at %d MB' % (os.path.getsize(part) // 1_000_000))
+            if sha256(part) != sha:
+                os.remove(part)
+                raise IOError("its check didn't match")
+            os.replace(part, path)
+            return
+        except Exception as e:
+            if attempt == 2:
+                if os.path.isfile(part):
+                    os.remove(part)
+                raise IOError("didn't download (%s)" % (e if isinstance(e, IOError) else type(e).__name__))
+            time.sleep(20)
+
+
+def bench_quiet(r):
+    """Waits till no TV has asked for a while (the bench never slows the TVs' answers); true if it was quiet."""
+    t0 = time.time()
+    while time.time() - state['last_look'] < BENCH_QUIET:
+        if time.time() - t0 > BENCH_WAIT:
+            return False
+        r['now'] = 'waiting for the TVs to stop asking'
+        time.sleep(2)
+    return True
+
+
+def bench_time(path, side, threads, r):
+    """One number: the middle of the timed runs (ms) on this many cores, its load time (s) and memory (MB), and whether
+    a TV asked meanwhile."""
+    m0 = rss()
+    t0 = time.time()
+    o = ort.SessionOptions()
+    o.intra_op_num_threads = threads
+    o.inter_op_num_threads = 1
+    o.add_session_config_entry('session.intra_op.allow_spinning', '0')
+    s = ort.InferenceSession(path, o, providers=['CPUExecutionProvider'])
+    load_s = time.time() - t0
+    name = s.get_inputs()[0].name
+    x = np.random.default_rng(1).random((1, 3, side, side), dtype=np.float32)
+    s.run(None, {name: x})  # warms up
+    mem = max(0, rss() - m0)
+    times, busy, start = [], False, time.time()
+    looks = state['looks']
+    while len(times) < BENCH_RUNS and (len(times) < 2 or time.time() - start < BENCH_BUDGET):
+        r['now'] = 'timing on %d core%s (%d of %d)' % (threads, '' if threads == 1 else 's', len(times) + 1, BENCH_RUNS)
+        t1 = time.time()
+        s.run(None, {name: x})
+        times.append((time.time() - t1) * 1000)
+    busy = state['looks'] != looks
+    del s
+    times.sort()
+    return round(times[len(times) // 2]), round(load_s, 1), round(mem / 1e6), busy
+
+
+def bench_run():
+    """Every bench model in turn: downloaded, timed on 1 core and on 3, deleted (the TVs' own models only timed)."""
+    try:
+        bench_models()
+    except Exception as e:
+        bench['note'] = 'stopped (%s)' % type(e).__name__
+        say('the bench: ' + bench['note'])
+    finally:
+        if bench['state'] == 'running':
+            bench['state'] = 'stopped'
+
+
+def bench_view():
+    """The bench as it is now, for an answer (copied while it may be changing)."""
+    for _ in range(10):
+        try:
+            return json.loads(json.dumps(bench))
+        except RuntimeError:
+            time.sleep(0.05)
+    return {'state': bench['state'], 'note': 'busy: ask again'}
+
+
+def bench_models():
+    with bench_lock:
+        bench.update({'state': 'running', 'note': '', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'models': [],
+                      'memory_mb': round((meminfo('MemTotal') or 0) / 1e6)})
+        say('the bench: started (%d models)' % len(BENCH))
+        for mid, what, url, size, sha, side in BENCH:
+            r = {'id': mid, 'what': what, 'size_mb': round(size / 1e6), 'note': '', 'now': 'waiting'}
+            bench['models'].append(r)
+            path = MODEL if mid == MODEL_ID else SPOT_MODEL if mid == SPOT_ID else os.path.join(DATA, 'bench-%s.onnx' % mid)
+            try:
+                if url:
+                    free = shutil.disk_usage(DATA).free
+                    if free < size + BENCH_ROOM:
+                        r['note'] = 'not timed: no room for it (%d MB free)' % (free // 1_000_000)
+                        continue
+                    r['now'] = 'downloading'
+                    t0 = time.time()
+                    bench_get(path, url, size, sha)
+                    r['download_s'] = round(time.time() - t0)
+                elif not os.path.isfile(path):
+                    r['note'] = 'not timed: not downloaded yet'
+                    continue
+                avail = meminfo('MemAvailable')
+                if avail is not None and avail < size * 1.6 + (300 << 20):
+                    r['note'] = 'not timed: too little memory free (%d MB)' % (avail // 1_000_000)
+                    continue
+                busy = False
+                for threads in (1, THREADS):
+                    quiet = bench_quiet(r)
+                    ms, load_s, mem, asked = bench_time(path, side, threads, r)
+                    r['ms_%d' % threads] = ms
+                    r['load_s'] = load_s
+                    r['memory_mb'] = max(r.get('memory_mb', 0), mem)
+                    busy = busy or asked or not quiet
+                r['per_second'] = round(1000 / max(1, r['ms_%d' % THREADS]), 1)
+                if busy:
+                    r['note'] = 'a TV asked while it was timed (its times may be a little high)'
+                say('the bench: %s, %d ms on 1 core, %d ms on %d, %.1f pictures a second' % (
+                    what, r['ms_1'], r['ms_%d' % THREADS], THREADS, r['per_second']))
+            except Exception as e:
+                r['note'] = 'not timed: %s' % (e if isinstance(e, IOError) else type(e).__name__)
+                say('the bench: %s %s' % (what, r['note']))
+            finally:
+                r.pop('now', None)
+                if url and os.path.isfile(path):
+                    os.remove(path)  # only for the bench: not kept
+        bench['state'] = 'done'
+        timed = [m for m in bench['models'] if 'per_second' in m]
+        bench['note'] = '%d of %d timed' % (len(timed), len(BENCH))
+        say('the bench: done (%s)' % bench['note'])
 
 
 def home_network(addr):
@@ -765,13 +970,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     'spot_ready': state['spot_ready'], 'spot_note': state['spot_note'], 'spot_looks': state['spot_looks'],
                                     'spot_ms': round(state['spot_ms']), 'read_model': READ_ID, 'read_ready': state['read_ready'],
                                     'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms']),
-                                    'read_side_max': READ_SIDE_MAX, 'ads': ads.n, 'ads_note': ads.note})
-        self.reply(404, {'note': 'GET /status, POST /look, POST /read or POST /ads'})
+                                    'read_side_max': READ_SIDE_MAX, 'ads': ads.n, 'ads_note': ads.note,
+                                    'bench': bench['state'] + (' (%s)' % bench['note'] if bench['note'] else '')})
+        if self.path.split('?')[0] == '/bench':
+            return self.reply(200, bench_view())
+        self.reply(404, {'note': 'GET /status, GET /bench, POST /look, POST /read, POST /ads or POST /bench'})
 
     def do_POST(self):
         if not home_network(self.client_address[0]):
             return self.reply(403, {'note': 'home network only'})
         path, _, query = self.path.partition('?')
+        if path == '/bench':
+            if bench['state'] == 'running':
+                return self.reply(409, {'note': 'the bench is already running', 'bench': bench_view()})
+            if not state['ready']:
+                return self.reply(503, {'note': 'not until the main model is ready'})
+            bench['state'] = 'running'
+            threading.Thread(target=bench_run, daemon=True).start()
+            return self.reply(202, {'note': 'the bench started: GET /bench says how far it is'})
         if path == '/ads':
             n = int(self.headers.get('Content-Length') or 0)
             if n <= 0 or n > 1_000_000:

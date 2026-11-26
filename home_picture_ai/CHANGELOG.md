@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0
+
+- The bench: times bigger models on this Pi, to pick the ad AI's next model. Started from the home network
+  (`POST /bench`), it downloads each one (a fixed version from Hugging Face, checked by its SHA-256), times it on 1
+  core and on 3 while no TV is asking (it waits for a quiet moment, so the TVs' answers never slow down), and deletes
+  it again. The two models the TVs use now are timed too, to compare. `GET /bench` says how far it is and each
+  model's times; `GET /status` says the bench's state (`bench`).
+- The models: Apple's MobileCLIP2-S2, -B and -L/14, and Google's SigLIP 2 B/16 and L/16 at 256 (also 8-bit). Each
+  needs room for itself plus 1 GB in this app's storage, and enough free memory; one that doesn't fit is skipped and
+  said so.
+- Nothing changes for the TVs: the same models answer them.
+
 ## 1.4.0
 
 - Reads a whole picture too, for the credits: a TV can send a whole frame (`POST /read?side=N`, a PNG or JPEG) and
