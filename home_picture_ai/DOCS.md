@@ -85,6 +85,10 @@ and words.
   byte each (base64), times its scale: a covered break's ads, at most 600 at a time. Answers `{"new", "again",
   "ads"}`: how many were new, how many were seen before, and how many it remembers now. Fingerprints from another
   model are turned away (409).
+- `POST /ads/forget` (since 1.7.0) with `{"model", "shows": [[scale, fingerprint], ...]}`: the show's own pictures (a
+  TV's, the channel's logo on), each fingerprint as for `POST /ads`. Every remembered ad as like one of them as an ad
+  seen again is let go (a break that wasn't one taught the memory the show). Answers `{"forgot", "ads"}`: how many
+  were let go, and how many it remembers now.
 - `GET /status`: `{"model", "version", "ready", "note", "looks", "ms", "up", "spot_model", "spot_ready",
   "spot_note", "spot_looks", "spot_ms", "read_model", "read_ready", "read_note", "reads", "read_ms", "read_side_max",
   "ads", "ads_note"}`. `read_side_max` (since 1.4.0): the largest `side` a TV can ask for.

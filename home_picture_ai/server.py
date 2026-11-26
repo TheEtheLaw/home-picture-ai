@@ -22,6 +22,8 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
                                                 "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
                                                 "spot_ms"}
     POST /ads                       {"model", "ads": [[scale, 512 int8 (base64)], ...]}  ->  {"new", "again", "ads"}
+    POST /ads/forget                {"model", "shows": [[scale, 512 int8 (base64)], ...]}  ->  {"forgot", "ads"} (1.7.0:
+                                                the show's own pictures; remembered ads like them let go)
     POST /read[?side=N][&signs=1]   a PNG or JPEG (a logo's spot; with side, a whole picture looked at with its longer
                                                 side N, 256 to 1280)  ->  {"read_model", "lines" [{"text", "score",
                                                 "box"}], "read_ms", "side"}, and with signs=1 (1.6.0) "signs" (an ad's
@@ -63,7 +65,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -121,6 +123,9 @@ ADS_PROBE = 8
 ADS_LOG_MAX = 32 << 20
 ADS_HEAD = b'HPA-ADS1'
 ADS_REC = 520  # a logged ad: its 512 numbers a byte each, its scale (float32), the day it was seen (int32)
+# (1.7.0) The show's own pictures (a TV's, with the channel's logo on) let go of the remembered ads ADS_SAME or more like
+# them, up to ADS_FORGET_EACH a picture: a break that wasn't one (the AI taking a show for ads) taught the memory the show.
+ADS_FORGET_EACH = 32
 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
@@ -211,6 +216,8 @@ class AdMemory:
 
     def _clear(self):
         self.n = 0
+        self.dead = 0       # (1.7.0) ones let go (their scale 0: never alike again), and whether that's written yet
+        self.dirty = False
         self._alloc(1024)
         self.cent = None    # the groups' centers (ADS_GROUPS x 512, length 1), once there's an index, and what all the
         self.mu = None      # ads have in common (taken away before grouping: else a few groups would take nearly all)
@@ -303,9 +310,29 @@ class AdMemory:
                 new += 1
             if recs:
                 self._log(recs, first)
-            self.note = '%d ads' % self.n
+            self.note = '%d ads' % (self.n - self.dead)
             self._next()
-            return new, again, self.n
+            return new, again, self.n - self.dead
+
+    def forget(self, vs):
+        """(1.7.0) The show's own pictures from a TV (the channel's logo on): every remembered ad ADS_SAME or more like
+        one is let go (its scale 0, so nothing is alike it again), written whole soon after. How many went, how many
+        are left."""
+        gone = 0
+        with self.lock:
+            for v in vs:
+                for _ in range(ADS_FORGET_EACH):
+                    sim, i = self._best(v)
+                    if i < 0 or sim < ADS_SAME:
+                        break
+                    self.s[i] = 0.0
+                    gone += 1
+            if gone:
+                self.dead += gone
+                self.dirty = True
+                self.note = '%d ads' % (self.n - self.dead)
+                self._next()
+            return gone, self.n - self.dead
 
     def _log(self, recs, first):
         with open(self.logp, 'ab') as f:
@@ -355,7 +382,8 @@ class AdMemory:
                 except FileNotFoundError:
                     pass
                 logged = self._replay(self.logp + '.old') + self._replay(self.logp)
-                self.note = '%d ads' % self.n
+                self.dead = int((self.s[:self.n] == 0).sum())
+                self.note = '%d ads' % (self.n - self.dead)
             except LookupError:
                 self._clear()
                 self._drop_logs()
@@ -399,7 +427,7 @@ class AdMemory:
         if self.n >= ADS_INDEX_FROM and (self.cent is None or self.n >= 16 * self.indexed):
             self.busy = True
             self.work.submit(self._job, self._index)
-        elif self.n >= ADS_CEILING or (os.path.exists(self.logp) and os.path.getsize(self.logp) > ADS_LOG_MAX):
+        elif self.dirty or self.n >= ADS_CEILING or (os.path.exists(self.logp) and os.path.getsize(self.logp) > ADS_LOG_MAX):
             self.busy = True
             self.work.submit(self._job, self._tidy)
 
@@ -420,7 +448,8 @@ class AdMemory:
         t0 = time.time()
         k = ADS_GROUPS
         rng = np.random.default_rng(n0)
-        pick = np.sort(rng.choice(n0, size=min(n0, 16 * k), replace=False))
+        live = np.flatnonzero(s[:n0] > 0)  # (1.7.0) not the ones let go
+        pick = np.sort(rng.choice(live, size=min(len(live), 16 * k), replace=False))
         x = q[pick].astype(np.float32) * s[pick, None]
         mu = x.mean(axis=0)
         x = x - mu
@@ -474,6 +503,7 @@ class AdMemory:
                     self._index_from(cent, indexed)  # the groups stay as they were
                 self._drop_logs()  # its rows are numbered anew: the file below has them all
             n = self.n
+            self.dirty = False  # what's let go is in this copy
             snap = {'model': np.array(MODEL_ID), 'q': self.q[:n].copy(), 'scale': self.s[:n].copy(),
                     'count': self.count[:n].copy(), 'day': self.day[:n].copy(), 'cell': self.cell[:n].copy(),
                     'cent': self.cent.copy() if self.cent is not None else np.zeros((0, 512), np.float32),
@@ -494,13 +524,10 @@ class AdMemory:
 ads = AdMemory(ADS_FILE, ADS_LOG)
 
 
-def learn_ads(body):
-    """POST /ads: {"model", "ads": [[scale, 512 int8 (base64)], ...]}."""
-    j = json.loads(body)
-    if j.get('model') != MODEL_ID:
-        raise LookupError('another model')
+def fingerprints(j, key):
+    """[[scale, 512 int8 (base64)], ...] under key, each of length 1."""
     vs = []
-    for item in (j.get('ads') or [])[:ADS_BATCH]:
+    for item in (j.get(key) or [])[:ADS_BATCH]:
         scale, b64 = float(item[0]), item[1]
         q = np.frombuffer(base64.b64decode(b64), np.int8)
         if len(q) != 512 or not np.isfinite(scale) or scale <= 0:
@@ -509,8 +536,27 @@ def learn_ads(body):
         n = np.linalg.norm(v)
         if n > 0:
             vs.append(v / n)
-    new, again, total = ads.learn(vs, int(time.time() // 86400))
+    return vs
+
+
+def learn_ads(body):
+    """POST /ads: {"model", "ads": [[scale, 512 int8 (base64)], ...]}."""
+    j = json.loads(body)
+    if j.get('model') != MODEL_ID:
+        raise LookupError('another model')
+    new, again, total = ads.learn(fingerprints(j, 'ads'), int(time.time() // 86400))
     return {'new': new, 'again': again, 'ads': total}
+
+
+def forget_ads(body):
+    """(1.7.0) POST /ads/forget: {"model", "shows": [[scale, 512 int8 (base64)], ...]}: the show's own pictures."""
+    j = json.loads(body)
+    if j.get('model') != MODEL_ID:
+        raise LookupError('another model')
+    gone, left = ads.forget(fingerprints(j, 'shows'))
+    if gone:
+        say('the ads remembered: %d let go, the show\'s own pictures from a TV (%d left)' % (gone, left))
+    return {'forgot': gone, 'ads': left}
 
 
 def say(s):
@@ -1549,7 +1595,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     'bench': bench['state'] + (' (%s)' % bench['note'] if bench['note'] else '')})
         if self.path.split('?')[0] == '/bench':
             return self.reply(200, bench_view())
-        self.reply(404, {'note': 'GET /status, GET /bench, POST /look, POST /read, POST /ads or POST /bench'})
+        self.reply(404, {'note': 'GET /status, GET /bench, POST /look, POST /read, POST /ads, POST /ads/forget or POST /bench'})
 
     def do_POST(self):
         if not home_network(self.client_address[0]):
@@ -1568,6 +1614,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             bench['busy'] = 'busy=1' in query.split('&')
             threading.Thread(target=bench_run, args=(which,), daemon=True).start()
             return self.reply(202, {'note': 'the bench (%s) started: GET /bench says how far it is' % which})
+        if path == '/ads/forget':
+            n = int(self.headers.get('Content-Length') or 0)
+            if n <= 0 or n > 1_000_000:
+                return self.reply(400, {'note': "the show's pictures, up to 1 MB"})
+            body = self.rfile.read(n)
+            try:
+                return self.reply(200, forget_ads(body))
+            except LookupError:
+                return self.reply(409, {'note': 'these were seen by another model (this one is %s)' % MODEL_ID})
+            except Exception as e:
+                return self.reply(400, {'note': 'not pictures it could use (%s)' % type(e).__name__})
         if path == '/ads':
             n = int(self.headers.get('Content-Length') or 0)
             if n <= 0 or n > 1_000_000:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0
+
+- The ads it remembers clean themselves: a TV sends the show's own pictures (ones with the channel's logo on that came
+  back as ads seen before) to `POST /ads/forget`, and every remembered ad as like one of them as an ad seen again is
+  let go. A break that wasn't one (the AI taking a show for ads, then its pictures remembered as the break's) can't go
+  on teaching it the show. What's let go stays let go when the app starts again.
+
 ## 1.6.0
 
 - An ad's words: `POST /read?side=N&signs=1` reads a whole picture and says what its lines say of an ad (`signs`): web
