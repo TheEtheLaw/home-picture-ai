@@ -65,6 +65,7 @@ Announced on the home network as `_homemedia._tcp`, port 8766.
   at once when no TV is reading it.
 - `POST /rec?name=<name>` with a recording's minute as the body: kept on the drive (a name used already gets a
   number). Answers what it holds (`pictures`, `full` full-size pictures and their `full_size`, `levels`, `notes`).
-- `GET /rec`: how many recordings there are, their size, and what the newest hold; `GET /rec/<name>`: one of them.
+- `GET /rec`: how many recordings there are, their size, and what the newest hold; `GET /rec?all=1`: every one (its
+  name and size, oldest first); `GET /rec/<name>`: one of them.
 - `GET /status`: the drive (ready or why not, its size and free space) and the files (size, how much is in and which
   parts, how fast it's coming in, state). The watchdog uses it; Home's player bar shows the parts.

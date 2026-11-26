@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.7'
+VERSION = '1.0.8'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -945,6 +945,12 @@ def rec_summary():
             'last': [f[1] for f in files[-5:]]}
 
 
+def rec_list():
+    """(1.0.8) Every recording on the drive, oldest first (its name and size), for tuning the ad AI at home."""
+    files = rec_files()
+    return {'files': [{'name': f[1], 'bytes': f[2]} for f in files], 'bytes': sum(f[2] for f in files)}
+
+
 def rec_tidy():
     """The drive running low: recordings go first (oldest first), before anything the TVs play."""
     free, size = drive.free()
@@ -1006,6 +1012,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.play(head=False)
         if self.path == '/rec':
             return self.answer(200, rec_summary())
+        if self.path == '/rec?all=1':
+            return self.answer(200, rec_list())
         if self.path.startswith('/rec/'):
             return self.rec_file()
         self.answer(404, {'error': 'not here'})

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.8
+
+- `GET /rec?all=1` lists every recording on the drive (its name and size, oldest first), so the ad AI can be tuned on
+  all of them at home, not only the newest few.
+
 ## 1.0.7
 
 - Keeps the ad watch's recordings from a TV whose recording is turned on (for tuning the ad AI on your own channels):
