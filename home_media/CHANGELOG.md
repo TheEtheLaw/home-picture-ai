@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.6
+
+- Each file in the list says which parts of it are in (`spans`: byte ranges, at most 32), so Home's player bar can
+  show what's on the Pi, not only what the TV has loaded.
+
 ## 1.0.5
 
 - A watched episode stays until a later episode of the show is a fifth of the way in (Home says so: `POST /moved_on`),

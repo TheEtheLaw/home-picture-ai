@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -34,6 +34,7 @@ DIR = os.path.join(MOUNT, 'home-media')
 DATA = os.environ.get('HOME_MEDIA_DATA', '/data')
 OPTIONS = os.path.join(DATA, 'options.json')
 CHUNK = 1 << 20            # the drive keeps track of what's in a mebibyte at a time
+SPANS = 32                 # (1.0.6) at most this many parts in a file's list entry
 BLOCK = 256 << 10          # read and written in quarter mebibytes
 AHEAD = 32 << 20           # a part wanted this close ahead of the download comes soon enough: no jump
 KEEP_FREE = int(os.environ.get('HOME_MEDIA_KEEP_FREE', 50 << 30))  # kept free on the drive (oldest unused go first)
@@ -393,7 +394,29 @@ class Item:
         return {'id': self.id, 'name': self.name, 'size': self.size, 'have': self.have_bytes(), 'complete': self.complete(),
                 'state': self.state, 'rate': int(self.rate), 'prefetch': self.prefetch, 'watched': self.watched,
                 'last_used': int(self.last_used), 'play': '/play/' + self.id, 'show': self.show, 'season': self.season,
-                'episode': self.episode}
+                'episode': self.episode, 'spans': self.spans()}
+
+    def spans(self, most=SPANS):
+        """(1.0.6) The parts that are in, as [start, end) byte offsets, in order (Home shows them on its player's bar,
+        so what's on the Pi can be seen, not only what the TV has loaded); at most {@code most}, the smallest gaps
+        closed first when there are more."""
+        if not self.size or not self.done:
+            return []
+        out = []
+        c, n = 0, len(self.done)
+        while c < n:
+            if not self.done[c]:
+                c += 1
+                continue
+            a = c
+            while c < n and self.done[c]:
+                c += 1
+            out.append([a * CHUNK, min(self.size, c * CHUNK)])
+        while len(out) > most:
+            k = min(range(len(out) - 1), key=lambda i: out[i + 1][0] - out[i][1])
+            out[k] = [out[k][0], out[k + 1][1]]
+            del out[k + 1]
+        return out
 
     # -- what to download next --
 

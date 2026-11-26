@@ -58,5 +58,5 @@ Announced on the home network as `_homemedia._tcp`, port 8766.
   episodes before it go (when no TV is reading them). `/get` takes the same three, for an episode.
   With `"why": "dropped"`: it isn't wanted any more (another copy was picked); its download stops at once, and it goes
   at once when no TV is reading it.
-- `GET /status`: the drive (ready or why not, its size and free space) and the files (size, how much is in, how fast
-  it's coming in, state). The watchdog uses it.
+- `GET /status`: the drive (ready or why not, its size and free space) and the files (size, how much is in and which
+  parts, how fast it's coming in, state). The watchdog uses it; Home's player bar shows the parts.
