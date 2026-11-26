@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -314,6 +314,10 @@ class Item:
         self.key = meta.get('key', '')
         self.name = meta.get('name', '')
         self.ext = meta.get('ext', 'mkv')
+        # (1.0.5) An episode's show (its IMDb id), season and episode: watched, it's kept until 20% of a later one plays
+        self.show = str(meta.get('show') or '')
+        self.season = int(meta.get('season') or 0)
+        self.episode = int(meta.get('episode') or 0)
         self.size = int(meta.get('size', 0))
         self.done = bytearray((self.size + CHUNK - 1) // CHUNK) if self.size else bytearray()
         for a, b in meta.get('have', []):
@@ -375,7 +379,8 @@ class Item:
             with self.save_lock:
                 save_json(self.meta_path(), {'key': self.key, 'name': self.name, 'ext': self.ext, 'size': self.size,
                                          'have': self.ranges_held(), 'created': self.created, 'last_used': self.last_used,
-                                             'watched': self.watched, 'prefetch': self.prefetch, 'ranges': self.ranges})
+                                             'watched': self.watched, 'prefetch': self.prefetch, 'ranges': self.ranges,
+                                             'show': self.show, 'season': self.season, 'episode': self.episode})
         except Exception as e:
             say('%s: couldn\'t note what\'s in (%s)' % (self.name, type(e).__name__))
 
@@ -387,7 +392,8 @@ class Item:
     def summary(self):
         return {'id': self.id, 'name': self.name, 'size': self.size, 'have': self.have_bytes(), 'complete': self.complete(),
                 'state': self.state, 'rate': int(self.rate), 'prefetch': self.prefetch, 'watched': self.watched,
-                'last_used': int(self.last_used), 'play': '/play/' + self.id}
+                'last_used': int(self.last_used), 'play': '/play/' + self.id, 'show': self.show, 'season': self.season,
+                'episode': self.episode}
 
     # -- what to download next --
 
@@ -664,6 +670,11 @@ def get(body):
             say('%s: asked for%s' % (name, ' (ahead of time)' if it.prefetch else ''))
         elif not body.get('prefetch'):
             it.prefetch = False  # it's playing now
+        show = str(body.get('show') or '')[:20]
+        if show and not it.show:
+            it.show = show
+            it.season = int(body.get('season') or 0)
+            it.episode = int(body.get('episode') or 0)
     with it.cond:
         it.url = url
         hdrs = body.get('headers') or {}
@@ -704,12 +715,34 @@ def done(body):
 DROPPED = 'not wanted: another copy was picked'
 
 
+def moved_on(body):
+    """(1.0.5) A later episode of a show is a fifth of the way in (POST /moved_on, from the TV playing it): that show's
+    episodes before it that were watched go (kept till then: he sometimes watches one again before going on, and a next
+    episode can start by itself at the end)."""
+    show = str(body.get('show') or '')
+    try:
+        at = (int(body.get('season') or 0), int(body.get('episode') or 0))
+    except (TypeError, ValueError):
+        raise ValueError('season and episode are numbers')
+    if not show or at == (0, 0):
+        raise ValueError('show, season and episode needed')
+    gone = 0
+    with items_lock:
+        mine = [i for i in items.values() if i.show == show and i.watched and (i.season, i.episode) < at]
+    for it in mine:
+        if it.readers == 0:
+            forget(it, 'watched, and S%dE%d is a fifth of the way in' % at)
+            gone += 1
+    return {'ok': True, 'gone': gone}
+
+
 
 def tidy():
     """Watched files go; one not watched (the next episode waiting for the weekend, one paused partway) after a week
     and a day unused (the setting: a Saturday's is still there the next Saturday); the oldest idle ones when the drive
     runs low."""
     keep_days = float(options().get('keep_days', 8) or 8)
+    film_hours = float(options().get('film_hours', 6) or 6)
     now = time.time()
     with items_lock:
         all_items = list(items.values())
@@ -717,8 +750,9 @@ def tidy():
         if it.readers > 0:
             continue
         why = None
-        if it.watched and (it.dropped or now - it.last_used > 60):
-            why = DROPPED if it.dropped else 'watched'
+        if it.watched and (it.dropped or (not it.show and now - it.last_used > film_hours * 3600)):
+            # (a film, watched: kept some hours to go back to; an episode, watched, waits for a later one: moved_on)
+            why = DROPPED if it.dropped else 'watched %g hours ago' % film_hours
         elif now - it.last_used > keep_days * 86400:
             why = 'unused for %g days' % keep_days
         if why:
@@ -820,6 +854,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.answer(200, get(body))
             if self.path == '/done':
                 return self.answer(200, done(body))
+            if self.path == '/moved_on':
+                return self.answer(200, moved_on(body))
         except ValueError as e:
             return self.answer(400, {'error': str(e)})
         self.answer(404, {'error': 'not here'})

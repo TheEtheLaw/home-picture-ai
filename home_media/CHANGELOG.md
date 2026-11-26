@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5
+
+- A watched episode stays until a later episode of the show is a fifth of the way in (Home says so: `POST /moved_on`),
+  so watching it again first is instant, and a next episode that starts by itself at the end doesn't take it away. Each
+  file notes its show, season and episode when Home gives them.
+- A watched film stays 6 hours after it was last played, to go back to (the new setting **Hours to keep a watched
+  film**); it went within minutes before.
+
 ## 1.0.4
 
 - The next episode, waiting to come in ahead of time, starts coming in the moment a TV plays it (it could wait up to 5 s).

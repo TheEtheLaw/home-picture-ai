@@ -1,5 +1,5 @@
 name: Home media
-version: "1.0.4"
+version: "1.0.5"
 slug: home_media
 description: Downloads what Home plays onto its own USB drive and plays it to the TVs from there, so every jump is instant.
 url: https://github.com/TheEtheLaw/home-picture-ai
@@ -18,6 +18,8 @@ watchdog: "http://[HOST]:[PORT:8766]/status"
 options:
   format_new_drive: true
   keep_days: 8
+  film_hours: 6
 schema:
   format_new_drive: bool
   keep_days: "int(1,30)"
+  film_hours: "int(1,72)"
