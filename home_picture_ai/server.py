@@ -22,8 +22,9 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
                                                 "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
                                                 "spot_ms"}
     POST /ads                       {"model", "ads": [[scale, 512 int8 (base64)], ...]}  ->  {"new", "again", "ads"}
-    POST /ads/forget                {"model", "shows": [[scale, 512 int8 (base64)], ...]}  ->  {"forgot", "ads"} (1.7.0:
-                                                the show's own pictures; remembered ads like them let go)
+    POST /ads/forget                {"model", "shows": [[scale, 512 int8 (base64)], ...], "logo": "goes"}  ->  {"forgot",
+                                                "ads"} (1.7.0: the show's own pictures; remembered ads like them let go;
+                                                1.7.2: only with "logo": "goes", a logo the TV saw go away in breaks)
     POST /read[?side=N][&signs=1]   a PNG or JPEG (a logo's spot; with side, a whole picture looked at with its longer
                                                 side N, 256 to 1280)  ->  {"read_model", "lines" [{"text", "score",
                                                 "box"}], "read_ms", "side"}, and with signs=1 (1.6.0) "signs" (an ad's
@@ -65,7 +66,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.7.1'
+VERSION = '1.7.2'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -127,9 +128,9 @@ ADS_REC = 520  # a logged ad: its 512 numbers a byte each, its scale (float32), 
 # them, up to ADS_FORGET_EACH a picture: a break that wasn't one (the AI taking a show for ads) taught the memory the show.
 ADS_FORGET_EACH = 32
 # (1.7.1) Paused: a channel can keep its logo on through its ads (on FS1 the logo in the bottom bar stays), so a TV's
-# "show pictures" with the logo on can be real ads; letting go waits for the TVs to know which logos really go away in
-# breaks. POST /ads/forget answers as before but lets nothing go while this is off.
-ADS_FORGET_ON = False
+# "show pictures" with the logo on can be real ads. (1.7.2) On again, only for a TV that says its pictures' logo is one
+# it has seen go away in breaks ("logo": "goes", Home 2.08: its being on is the show's); others let nothing go.
+ADS_FORGET_ON = True
 
 direction = np.fromfile(os.path.join(HERE, 'direction.bin'), dtype='<f4')
 state = {'ready': False, 'note': 'starting', 'looks': 0, 'ms': 0.0, 'since': time.time(),
@@ -560,6 +561,9 @@ def forget_ads(body):
     shows = fingerprints(j, 'shows')
     if not ADS_FORGET_ON:
         return {'forgot': 0, 'ads': ads.n - ads.dead, 'note': 'letting go is paused for now (1.7.1)'}
+    if j.get('logo') != 'goes':
+        return {'forgot': 0, 'ads': ads.n - ads.dead,
+                'note': 'only pictures whose logo the TV has seen go away in breaks let go of ads (a TV before Home 2.08)'}
     gone, left = ads.forget(shows)
     if gone:
         say('the ads remembered: %d let go, the show\'s own pictures from a TV (%d left)' % (gone, left))

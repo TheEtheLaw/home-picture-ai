@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2
+
+- Letting go of remembered ads is on again, for the pictures a TV sends with `"logo": "goes"`: their logo is one the TV
+  has seen go away in the channel's breaks (Home 2.08 learns which logos stay on through ads, like FS1's in its bottom
+  bar, and stops counting those). Pictures sent without it (a TV before Home 2.08) let nothing go.
+
 ## 1.7.1
 
 - Letting go of remembered ads (`POST /ads/forget`) is paused: a channel can keep its logo on through its ads (FS1's
