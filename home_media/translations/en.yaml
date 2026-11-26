@@ -7,5 +7,10 @@ configuration:
   keep_days:
     name: Days to keep
     description: >-
-      A file that hasn't been watched (the next episode, or one stopped partway) goes once nobody has played it for
-      this many days.
+      A file nobody has played for this many days goes (the next episode waiting, one stopped partway, or a watched
+      episode whose next one hasn't been played).
+  film_hours:
+    name: Hours to keep a watched film
+    description: >-
+      A film that's been watched stays this long after it was last played, to go back to (an episode that's been
+      watched stays until a later one of its show is a fifth of the way in).
