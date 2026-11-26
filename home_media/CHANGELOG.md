@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.3
+
+- A file once watched stops coming in at once (it went on to the end before, alongside the next episode); played again,
+  it goes on.
+- The TVs' asks are answered at once while a file comes in at full speed: what's in is noted on the drive afterwards,
+  not while the TV waits (one ask took 6.8 s).
+
 ## 1.0.2
 
 - The next episode, coming in ahead of time, hands its connection over the moment one being played starts coming in, and

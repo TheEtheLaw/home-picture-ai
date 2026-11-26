@@ -16,6 +16,7 @@ import http.server
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -24,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -378,6 +379,11 @@ class Item:
         except Exception as e:
             say('%s: couldn\'t note what\'s in (%s)' % (self.name, type(e).__name__))
 
+    def save_soon(self):
+        """Noted on the drive, but not while a TV waits for the answer (writing it out can take seconds while a file
+        comes in at full speed)."""
+        threading.Thread(target=self.save, args=(True,), name='save-' + self.id, daemon=True).start()
+
     def summary(self):
         return {'id': self.id, 'name': self.name, 'size': self.size, 'have': self.have_bytes(), 'complete': self.complete(),
                 'state': self.state, 'rate': int(self.rate), 'prefetch': self.prefetch, 'watched': self.watched,
@@ -419,9 +425,10 @@ class Item:
         backoff = 5
         at = None
         while not self.gone:
-            if self.dropped:
-                self.state = 'not wanted'
-                return
+            if self.dropped or self.watched:
+                self.state = 'not wanted' if self.dropped else 'watched'
+                self.save(True)
+                return  # (watched: nothing more of it is needed; a TV asking for it again starts it again)
             with self.cond:
                 pos = self.next_pos(at)
                 if pos is None:
@@ -507,7 +514,7 @@ class Item:
                     if self.ranges and self.jump_wanted(off):
                         say('%s: a jump to %s: the download goes there first' % (self.name, size_text(self.want)))
                         return None
-                    if self.dropped:
+                    if self.dropped or self.watched:
                         return off
                     if self.prefetch and self.ranges and others_busy(self):
                         say('%s: one being played started coming in: this one (ahead of time) waits for it' % self.name)
@@ -666,7 +673,7 @@ def get(body):
             it.state = 'starting'  # its fresh link: the download picks it up at once
         it.cond.notify_all()
     it.start()
-    it.save(True)
+    it.save_soon()
     return it.summary()
 
 
@@ -687,7 +694,9 @@ def done(body):
         if it.readers == 0:
             forget(it, DROPPED)
             return {'ok': True}
-    it.save(True)
+    with it.cond:
+        it.cond.notify_all()  # its download stops: nothing more of it is needed
+    it.save_soon()
     return {'ok': True}
 
 
@@ -930,7 +939,17 @@ class Server(http.server.ThreadingHTTPServer):
             say('a request failed (%s)' % type(e).__name__)
 
 
+def stopping(signum, frame):
+    """Told to stop (an update, a restart): what's in each file, and what was watched, noted on the drive first."""
+    with items_lock:
+        all_items = list(items.values())
+    for it in all_items:
+        it.save(True)
+    sys.exit(0)
+
+
 def main():
+    signal.signal(signal.SIGTERM, stopping)
     srv = Server(('0.0.0.0', PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     say('Home media %s, answering on port %d' % (VERSION, PORT))
