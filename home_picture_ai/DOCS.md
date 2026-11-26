@@ -41,6 +41,15 @@ GB in all). `GET /bench` says how far it is: for each model its size, its time f
 3 (`ms_3`), how many pictures a second that is (`per_second`), its memory, and why one wasn't timed (no room, too
 little memory, a download that didn't come or didn't check out).
 
+Since 1.5.1 the bench is for one TV at a time (`POST /bench`; the first one is `POST /bench?set=all`): what counts is
+how many pictures a second the Pi gets through, since the look ahead gives the AI seconds before a picture is on
+screen. Each model is timed on 1 core, on all 4 one picture at a time, with 4 pictures at once (a core each) and with 4
+in one batch: `per_second` is its best way (`best`), `every_picture` whether that keeps up with one TV (2 a second).
+It also makes 8-bit copies of Apple's models here, of their matrix math only and of all of them (set on 48 of the
+TVs' recorded pictures, read from Home media on this Pi), and checks each against the original on 16 others
+(`fidelity`, 1 is the same). Everything it downloads or makes is deleted when it's done. `POST /bench?busy=1` times
+even while a TV is asking (its times then a little high, and said so).
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how

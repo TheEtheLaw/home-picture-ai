@@ -12,6 +12,9 @@ RUN pip install --only-binary=:all: \
 # which would need OpenCV, isn't used).
 RUN pip install --only-binary=:all: --no-deps rapidocr-onnxruntime==1.4.4
 
+# The bench's 8-bit copies (1.5.1): ONNX Runtime's quantizer needs the ONNX package.
+RUN pip install --only-binary=:all: --no-deps onnx==1.23.2 ml_dtypes==0.7.0 typing_extensions==4.16.0
+
 COPY server.py direction.bin /app/
 
 CMD ["python3", "-u", "/app/server.py"]

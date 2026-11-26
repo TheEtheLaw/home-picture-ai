@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.1
+
+- The bench for one TV at a time (the default; `POST /bench?set=all` is 1.5.0's): what counts is how many pictures a
+  second the Pi gets through, since the look ahead gives the AI seconds before a picture is on screen. Each model is
+  timed on 1 core, on all 4 one picture at a time, with 4 pictures at once (a core each) and with 4 in one batch;
+  `per_second` is its best way (`best`), and `every_picture` says whether that keeps up with one TV (2 a second).
+- 8-bit copies made here: of MobileCLIP2-S0, -S2 and -B, both of the matrix math only and of all of it (set on 48 of
+  the TVs' recorded pictures from Home media), each checked against the original on 16 others (`fidelity`: how alike
+  they see them, 1 is the same).
+- `POST /bench?busy=1` times even while a TV is asking (its times then a little high, and said so).
+- Adds the ONNX package (1.23.2) for that, a fixed version. Nothing changes for the TVs.
+
 ## 1.5.0
 
 - The bench: times bigger models on this Pi, to pick the ad AI's next model. Started from the home network

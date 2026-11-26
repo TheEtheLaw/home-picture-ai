@@ -50,13 +50,14 @@ import shutil
 import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -156,6 +157,35 @@ BENCH_BUDGET = 150      # seconds at most for each number (at least 2 runs)
 BENCH_QUIET = 20        # no TV asking for this long before a timing starts
 BENCH_WAIT = 1800       # waits this long at most for that, then times anyway (and says so)
 BENCH_ROOM = 1 << 30    # storage left free besides the model
+# (1.5.1) One TV at a time (two are seldom on at once): what counts is how many pictures a second the Pi gets through,
+# not how soon one answer comes (the look ahead gives a head start of seconds, from what's shown to the newest picture
+# downloaded), so each model is timed on all the cores one picture at a time, with four pictures at once (a core each)
+# and with four in one batch; and 8-bit copies made here (its matrix math only; or all of it, set on the TVs' recorded
+# pictures), with how like the original they see.
+NORM = {'clip': (MEAN, STD), 'unit': (np.zeros(3, np.float32), np.ones(3, np.float32)),
+        'half': (np.full(3, 0.5, np.float32), np.full(3, 0.5, np.float32))}
+# (id, what, source, size, SHA-256, picture side, mean and spread, make): source None (a model the TVs use now), an
+# address, or the id of a model above to make an 8-bit copy of (make: 'dynamic' or 'static').
+BENCH_ONE = [
+    ('clip-vit-b32', "CLIP ViT-B/32 (the AI's now)", None, 351_685_709, None, 224, 'clip', None),
+    ('mobileclip2-s0', "MobileCLIP2-S0 (the logo's spot now)", None, 45_555_784, None, 256, 'unit', None),
+    ('mobileclip2-s0-q8s', 'MobileCLIP2-S0, 8-bit (all of it)', 'mobileclip2-s0', 0, None, 256, 'unit', 'static'),
+    ('mobileclip2-s2', 'MobileCLIP2-S2', MC2 + 's2/vision_model.onnx', 143_044_797,
+     'a841f72c5a5085748bbe271a1d5718aba877822a15cba865bdbd0d37036b849e', 256, 'unit', None),
+    ('mobileclip2-s2-q8d', 'MobileCLIP2-S2, 8-bit (its matrix math)', 'mobileclip2-s2', 0, None, 256, 'unit', 'dynamic'),
+    ('mobileclip2-s2-q8s', 'MobileCLIP2-S2, 8-bit (all of it)', 'mobileclip2-s2', 0, None, 256, 'unit', 'static'),
+    ('mobileclip2-b', 'MobileCLIP2-B', MC2 + 'b/vision_model.onnx', 345_545_489,
+     '2f3873e400fd1adc5298b72d29e81bb69337e58601cf2853c43bc1211631eecd', 224, 'unit', None),
+    ('mobileclip2-b-q8d', 'MobileCLIP2-B, 8-bit (its matrix math)', 'mobileclip2-b', 0, None, 224, 'unit', 'dynamic'),
+    ('mobileclip2-b-q8s', 'MobileCLIP2-B, 8-bit (all of it)', 'mobileclip2-b', 0, None, 224, 'unit', 'static'),
+    ('siglip2-b16-256-int8', 'SigLIP 2 B/16, 256 (8-bit)', SG2B + 'vision_model_int8.onnx', 94_737_653,
+     '8243a496e524bf8fa19830ff42a40a4bae2e97acc2e288d4ae97601edf954977', 256, 'half', None),
+]
+THREADS_ALL = os.cpu_count() or 4  # all of the Pi's cores (4)
+BENCH_PAR_S = 20       # about this long for the pictures-at-once timing
+BENCH_CALIBRATE = 48   # recorded pictures an 8-bit copy is set on (the next 16 check it)
+ONE_TV = 2.0           # pictures a second one TV sends at most (every picture while a break may start or is on)
+MEDIA = 'http://127.0.0.1:8766'  # Home media on this Pi (its recordings)
 bench = {'state': 'not run yet', 'note': '', 'at': None, 'memory_mb': None, 'models': []}
 bench_lock = threading.Lock()
 
@@ -831,6 +861,8 @@ def bench_get(path, url, size, sha):
 
 def bench_quiet(r):
     """Waits till no TV has asked for a while (the bench never slows the TVs' answers); true if it was quiet."""
+    if bench.get('busy'):  # (1.5.1) asked to time even while a TV asks (its times then a little high, and said so)
+        return time.time() - state['last_look'] >= BENCH_QUIET
     t0 = time.time()
     while time.time() - state['last_look'] < BENCH_QUIET:
         if time.time() - t0 > BENCH_WAIT:
@@ -840,22 +872,26 @@ def bench_quiet(r):
     return True
 
 
+def bench_session(path, threads):
+    o = ort.SessionOptions()
+    o.intra_op_num_threads = threads
+    o.inter_op_num_threads = 1
+    o.add_session_config_entry('session.intra_op.allow_spinning', '0')
+    return ort.InferenceSession(path, o, providers=['CPUExecutionProvider'])
+
+
 def bench_time(path, side, threads, r):
     """One number: the middle of the timed runs (ms) on this many cores, its load time (s) and memory (MB), and whether
     a TV asked meanwhile."""
     m0 = rss()
     t0 = time.time()
-    o = ort.SessionOptions()
-    o.intra_op_num_threads = threads
-    o.inter_op_num_threads = 1
-    o.add_session_config_entry('session.intra_op.allow_spinning', '0')
-    s = ort.InferenceSession(path, o, providers=['CPUExecutionProvider'])
+    s = bench_session(path, threads)
     load_s = time.time() - t0
     name = s.get_inputs()[0].name
     x = np.random.default_rng(1).random((1, 3, side, side), dtype=np.float32)
     s.run(None, {name: x})  # warms up
     mem = max(0, rss() - m0)
-    times, busy, start = [], False, time.time()
+    times, start = [], time.time()
     looks = state['looks']
     while len(times) < BENCH_RUNS and (len(times) < 2 or time.time() - start < BENCH_BUDGET):
         r['now'] = 'timing on %d core%s (%d of %d)' % (threads, '' if threads == 1 else 's', len(times) + 1, BENCH_RUNS)
@@ -868,10 +904,164 @@ def bench_time(path, side, threads, r):
     return round(times[len(times) // 2]), round(load_s, 1), round(mem / 1e6), busy
 
 
-def bench_run():
-    """Every bench model in turn: downloaded, timed on 1 core and on 3, deleted (the TVs' own models only timed)."""
+def bench_parallel(path, side, n, ms_1, r):
+    """(1.5.1) Pictures a second with n pictures at once, one core each (the look ahead's head start lets pictures wait
+    their turn), and whether a TV asked meanwhile."""
+    r['now'] = 'timing %d pictures at once, one core each' % n
+    sessions = [bench_session(path, 1) for _ in range(n)]
+    name = sessions[0].get_inputs()[0].name
+    xs = [np.random.default_rng(i).random((1, 3, side, side), dtype=np.float32) for i in range(n)]
+    for k, s in enumerate(sessions):
+        s.run(None, {name: xs[k]})
+    rounds = max(2, min(20, round(BENCH_PAR_S * 1000 / max(1, ms_1))))
+    looks = state['looks']
+
+    def work(k):
+        for _ in range(rounds):
+            sessions[k].run(None, {name: xs[k]})
+
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(work, range(n)))
+    wall = time.time() - t0
+    del sessions
+    return round(n * rounds / wall, 2), state['looks'] != looks
+
+
+def bench_batch(path, side, n, threads, r):
+    """(1.5.1) Pictures a second with n pictures in one batch on this many cores, or None if it takes one at a time."""
+    s = bench_session(path, threads)
+    inp = s.get_inputs()[0]
+    if isinstance(inp.shape[0], int) and inp.shape[0] != n:
+        return None, False
+    x = np.random.default_rng(2).random((n, 3, side, side), dtype=np.float32)
     try:
-        bench_models()
+        s.run(None, {inp.name: x})
+    except Exception:
+        return None, False
+    times, start = [], time.time()
+    looks = state['looks']
+    while len(times) < 5 and (len(times) < 2 or time.time() - start < BENCH_BUDGET / 2):
+        r['now'] = 'timing %d pictures in a batch on %d cores (%d of 5)' % (n, threads, len(times) + 1)
+        t1 = time.time()
+        s.run(None, {inp.name: x})
+        times.append(time.time() - t1)
+    times.sort()
+    return round(n / times[len(times) // 2], 2), state['looks'] != looks
+
+
+def rec_pictures(limit=200):
+    """(1.5.1) The TVs' recorded pictures (what they send for a look, 320x180 JPEGs), newest minutes first, from Home
+    media on this Pi (its recordings of his channels): for setting an 8-bit copy and checking it against the original."""
+    out = []
+    try:
+        with urllib.request.urlopen(MEDIA + '/rec', timeout=10) as r:
+            names = list(reversed(json.loads(r.read()).get('last') or []))
+    except Exception:
+        return out
+    for n in names:
+        try:
+            with urllib.request.urlopen(MEDIA + '/rec/' + urllib.parse.quote(n), timeout=60) as r:
+                data = r.read()
+        except Exception:
+            continue
+        out.extend(rec_jpegs(data))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def rec_jpegs(data):
+    """The 'F' pictures in a recording (Home's RecFile: a kind byte, the time, then the kind's own fields)."""
+    out, i, n = [], 0, len(data)
+    while i + 9 <= n:
+        k = data[i]
+        i += 9  # the kind and the time
+        if k == 0x46:  # F: length, JPEG
+            ln = int.from_bytes(data[i:i + 4], 'big')
+            out.append(data[i + 4:i + 4 + ln])
+            i += 4 + ln
+        elif k == 0x47:  # G: width, height, length, JPEG (a full-size picture)
+            ln = int.from_bytes(data[i + 4:i + 8], 'big')
+            i += 8 + ln
+        elif k == 0x41:  # A: the sound's level
+            i += 2
+        elif k == 0x53:  # S: peak, width, flatness, bands
+            i += 6 + data[i + 5] if i + 6 <= n else n
+        elif k == 0x45:  # E: a note
+            i += 2 + int.from_bytes(data[i:i + 2], 'big')
+        else:
+            break
+    return [j for j in out if j[:2] == b'\xff\xd8']
+
+
+def bench_input(jpeg, side, norm):
+    """A recorded picture as a model's input: squeezed to side x side, by its mean and spread."""
+    mean, std = NORM[norm]
+    a = np.asarray(Image.open(io.BytesIO(jpeg)).convert('RGB').resize((side, side), Image.BILINEAR), np.float32) / 255.0
+    return ((a - mean) / std).transpose(2, 0, 1)[None].astype(np.float32)
+
+
+def embed_name(s):
+    names = [o.name for o in s.get_outputs()]
+    for want in ('image_embeds', 'pooler_output'):
+        if want in names:
+            return want
+    return names[0]
+
+
+def make_q8(src, dst, mode, side, norm, pics, r):
+    """(1.5.1) An 8-bit copy of a model, made here: 'dynamic' (its matrix math, nothing to set) or 'static' (all of it,
+    set on recorded pictures)."""
+    import logging
+    logging.getLogger().setLevel(logging.ERROR)  # the quantizer's advice, not for this log
+    from onnxruntime.quantization import (CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType,
+                                          quantize_dynamic, quantize_static)
+    if mode == 'dynamic':
+        r['now'] = 'making its 8-bit copy'
+        quantize_dynamic(src, dst, weight_type=QuantType.QInt8, op_types_to_quantize=['MatMul', 'Gemm'])
+        return
+    if len(pics) < 16:
+        raise IOError('too few recorded pictures to set it on (%d)' % len(pics))
+
+    class Reader(CalibrationDataReader):
+        def __init__(self, name):
+            self.left = [bench_input(j, side, norm) for j in pics[:BENCH_CALIBRATE]]
+            self.name = name
+
+        def get_next(self):
+            r['now'] = 'setting its 8-bit copy on recorded pictures (%d left)' % len(self.left)
+            return {self.name: self.left.pop()} if self.left else None
+
+    name = bench_session(src, 1).get_inputs()[0].name
+    quantize_static(src, dst, Reader(name), quant_format=QuantFormat.QDQ, per_channel=True,
+                    activation_type=QuantType.QUInt8, weight_type=QuantType.QInt8,
+                    calibrate_method=CalibrationMethod.MinMax)
+
+
+def fidelity(src, dst, side, norm, pics, r):
+    """(1.5.1) How like the original an 8-bit copy sees recorded pictures (it never set on): the mean and the least
+    cosine of their embeddings."""
+    held = pics[BENCH_CALIBRATE:BENCH_CALIBRATE + 16] or pics[:16]
+    if not held:
+        return None, None
+    a, b = bench_session(src, THREADS_ALL), bench_session(dst, THREADS_ALL)
+    na, nb = a.get_inputs()[0].name, b.get_inputs()[0].name
+    oa, ob = embed_name(a), embed_name(b)
+    cos = []
+    for k, j in enumerate(held):
+        r['now'] = 'checking its 8-bit copy against the original (%d of %d)' % (k + 1, len(held))
+        x = bench_input(j, side, norm)
+        ea = a.run([oa], {na: x})[0].reshape(-1)
+        eb = b.run([ob], {nb: x})[0].reshape(-1)
+        cos.append(float(ea @ eb / (np.linalg.norm(ea) * np.linalg.norm(eb) + 1e-9)))
+    return round(float(np.mean(cos)), 4), round(float(np.min(cos)), 4)
+
+
+def bench_run(which='one'):
+    """Every bench model in turn: downloaded (or made), timed, deleted (the TVs' own models only timed)."""
+    try:
+        bench_models(which)
     except Exception as e:
         bench['note'] = 'stopped (%s)' % type(e).__name__
         say('the bench: ' + bench['note'])
@@ -890,55 +1080,95 @@ def bench_view():
     return {'state': bench['state'], 'note': 'busy: ask again'}
 
 
-def bench_models():
+def bench_models(which='one'):
     with bench_lock:
-        bench.update({'state': 'running', 'note': '', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'models': [],
-                      'memory_mb': round((meminfo('MemTotal') or 0) / 1e6)})
-        say('the bench: started (%d models)' % len(BENCH))
-        for mid, what, url, size, sha, side in BENCH:
+        models = BENCH_ONE if which == 'one' else [m + ('unit', None) for m in BENCH]
+        bench.update({'state': 'running', 'note': '', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'models': [], 'set': which,
+                      'memory_mb': round((meminfo('MemTotal') or 0) / 1e6), 'cores': os.cpu_count()})
+        say('the bench (%s): started (%d models)' % (which, len(models)))
+        made, pics = {}, None
+        paths = {}
+        for mid, what, src, size, sha, side, norm, make in models:
             r = {'id': mid, 'what': what, 'size_mb': round(size / 1e6), 'note': '', 'now': 'waiting'}
             bench['models'].append(r)
             path = MODEL if mid == MODEL_ID else SPOT_MODEL if mid == SPOT_ID else os.path.join(DATA, 'bench-%s.onnx' % mid)
             try:
-                if url:
+                if make:
+                    base = paths.get(src)
+                    if not base or not os.path.isfile(base):
+                        r['note'] = "not timed: the original wasn't here"
+                        continue
+                    if pics is None:
+                        r['now'] = 'reading recorded pictures'
+                        pics = rec_pictures()
+                        bench['pictures'] = len(pics)
+                    t0 = time.time()
+                    make_q8(base, path, make, side, norm, pics, r)
+                    made[mid] = path
+                    r['make_s'] = round(time.time() - t0)
+                    r['size_mb'] = round(os.path.getsize(path) / 1e6)
+                    r['fidelity'], r['fidelity_least'] = fidelity(base, path, side, norm, pics, r)
+                elif src:
                     free = shutil.disk_usage(DATA).free
                     if free < size + BENCH_ROOM:
                         r['note'] = 'not timed: no room for it (%d MB free)' % (free // 1_000_000)
                         continue
                     r['now'] = 'downloading'
                     t0 = time.time()
-                    bench_get(path, url, size, sha)
+                    bench_get(path, src, size, sha)
                     r['download_s'] = round(time.time() - t0)
+                    made[mid] = path
                 elif not os.path.isfile(path):
                     r['note'] = 'not timed: not downloaded yet'
                     continue
+                paths[mid] = path
                 avail = meminfo('MemAvailable')
-                if avail is not None and avail < size * 1.6 + (300 << 20):
+                fsize = os.path.getsize(path)
+                if avail is not None and avail < fsize * (1.6 if which == 'all' else 5) + (300 << 20):
                     r['note'] = 'not timed: too little memory free (%d MB)' % (avail // 1_000_000)
                     continue
                 busy = False
-                for threads in (1, THREADS):
+                for threads in ((1, THREADS) if which == 'all' else (1, THREADS_ALL)):
                     quiet = bench_quiet(r)
                     ms, load_s, mem, asked = bench_time(path, side, threads, r)
                     r['ms_%d' % threads] = ms
                     r['load_s'] = load_s
                     r['memory_mb'] = max(r.get('memory_mb', 0), mem)
                     busy = busy or asked or not quiet
-                r['per_second'] = round(1000 / max(1, r['ms_%d' % THREADS]), 1)
+                if which == 'all':
+                    r['per_second'] = round(1000 / max(1, r['ms_%d' % THREADS]), 1)
+                else:
+                    modes = {'one at a time on %d cores' % THREADS_ALL: round(1000 / max(1, r['ms_%d' % THREADS_ALL]), 2)}
+                    quiet = bench_quiet(r)
+                    ps, asked = bench_parallel(path, side, THREADS_ALL, r['ms_1'], r)
+                    busy = busy or asked or not quiet
+                    r['at_once_per_second'] = ps
+                    modes['%d at once, a core each' % THREADS_ALL] = ps
+                    quiet = bench_quiet(r)
+                    bs, asked = bench_batch(path, side, THREADS_ALL, THREADS_ALL, r)
+                    busy = busy or asked or not quiet
+                    if bs is not None:
+                        r['batch_per_second'] = bs
+                        modes['%d in a batch on %d cores' % (THREADS_ALL, THREADS_ALL)] = bs
+                    best = max(modes, key=modes.get)
+                    r['per_second'], r['best'] = modes[best], best
+                    r['every_picture'] = r['per_second'] >= ONE_TV
                 if busy:
                     r['note'] = 'a TV asked while it was timed (its times may be a little high)'
-                say('the bench: %s, %d ms on 1 core, %d ms on %d, %.1f pictures a second' % (
-                    what, r['ms_1'], r['ms_%d' % THREADS], THREADS, r['per_second']))
+                say('the bench: %s, %d ms on 1 core, %.2f pictures a second%s' % (
+                    what, r['ms_1'], r['per_second'], (' (%s)' % r['best']) if 'best' in r else ''))
             except Exception as e:
                 r['note'] = 'not timed: %s' % (e if isinstance(e, IOError) else type(e).__name__)
                 say('the bench: %s %s' % (what, r['note']))
             finally:
                 r.pop('now', None)
-                if url and os.path.isfile(path):
-                    os.remove(path)  # only for the bench: not kept
+        for path in made.values():  # only for the bench: not kept
+            for f in (path, path + '.part'):
+                if os.path.isfile(f):
+                    os.remove(f)
         bench['state'] = 'done'
         timed = [m for m in bench['models'] if 'per_second' in m]
-        bench['note'] = '%d of %d timed' % (len(timed), len(BENCH))
+        bench['note'] = '%d of %d timed' % (len(timed), len(models))
         say('the bench: done (%s)' % bench['note'])
 
 
@@ -985,9 +1215,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(409, {'note': 'the bench is already running', 'bench': bench_view()})
             if not state['ready']:
                 return self.reply(503, {'note': 'not until the main model is ready'})
+            which = 'all' if 'set=all' in query.split('&') else 'one'
             bench['state'] = 'running'
-            threading.Thread(target=bench_run, daemon=True).start()
-            return self.reply(202, {'note': 'the bench started: GET /bench says how far it is'})
+            bench['busy'] = 'busy=1' in query.split('&')
+            threading.Thread(target=bench_run, args=(which,), daemon=True).start()
+            return self.reply(202, {'note': 'the bench (%s) started: GET /bench says how far it is' % which})
         if path == '/ads':
             n = int(self.headers.get('Content-Length') or 0)
             if n <= 0 or n > 1_000_000:
