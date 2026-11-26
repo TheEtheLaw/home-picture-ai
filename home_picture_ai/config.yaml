@@ -1,5 +1,5 @@
 name: Home picture AI
-version: "1.5.1"
+version: "1.6.0"
 slug: home_picture_ai
 description: Looks at the pictures the TVs at home send it and says whether they're ads, for Home's ad screen.
 url: https://github.com/TheEtheLaw/home-picture-ai

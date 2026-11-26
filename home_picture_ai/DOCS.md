@@ -50,6 +50,15 @@ TVs' recorded pictures, read from Home media on this Pi), and checks each agains
 (`fidelity`, 1 is the same). Everything it downloads or makes is deleted when it's done. `POST /bench?busy=1` times
 even while a TV is asking (its times then a little high, and said so).
 
+Since 1.6.0 `POST /bench?set=read` reads the screen's words on his recordings (on Home media, on this Pi): up to 120
+pictures from the breaks (where a TV's break screen was up) and 120 from the programs (at least 30 seconds from any),
+read on 2 cores as a TV reads a whole picture. `GET /bench` then says, for each, how often an ad's signs were there
+(`share`: web addresses, phone numbers, prices, fine print's words, small lines, any of them), the words found
+(`examples`), how high the long lines are (`long_lines_by_height`), and which program pictures had an ad's words
+(`program_with_ad_signs`: maybe a break the screen missed). It also says where Home 2.05 put each break screen's change
+(`edges`) and how long the TVs' own reader takes at 960 and 1280 (`tv_reader_ms`). Nothing is kept but those numbers
+and words.
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how
@@ -68,6 +77,10 @@ even while a TV is asking (its times then a little high, and said so).
 - `POST /read?side=N` with a PNG or JPEG of a whole picture (since 1.4.0): the same answer, with the letters looked for
   at the picture's longer side N (256 to 1280, in steps of 32; `side` in the answer says which). A TV sends a 960x540
   picture at 768 near the end of an episode or a film, and knows the credits by their words. Without `side`, 256.
+  Since 1.6.0 each line also says where it is (`box`: left, top, right, bottom, in parts of the picture's width and
+  height), and with `signs=1` the answer says what the lines say of an ad (`signs`): `url`, `phone`, `price` and
+  `words` (fine print's usual words), each the words found; `small` (small lines of 12 letters or more); `ad` (a web
+  address, phone number or price, or fine print's words); and `why`.
 - `POST /ads` (since 1.3.0) with `{"model", "ads": [[scale, fingerprint], ...]}`, each fingerprint 512 numbers of a
   byte each (base64), times its scale: a covered break's ads, at most 600 at a time. Answers `{"new", "again",
   "ads"}`: how many were new, how many were seen before, and how many it remembers now. Fingerprints from another

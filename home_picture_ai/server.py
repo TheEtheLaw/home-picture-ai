@@ -22,20 +22,24 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
                                                 "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
                                                 "spot_ms"}
     POST /ads                       {"model", "ads": [[scale, 512 int8 (base64)], ...]}  ->  {"new", "again", "ads"}
-    POST /read[?side=N]             a PNG or JPEG (a logo's spot; with side, a whole picture looked at with its longer
-                                                side N, 256 to 1280)  ->  {"read_model", "lines" [{"text", "score"}],
-                                                "read_ms", "side"}
+    POST /read[?side=N][&signs=1]   a PNG or JPEG (a logo's spot; with side, a whole picture looked at with its longer
+                                                side N, 256 to 1280)  ->  {"read_model", "lines" [{"text", "score",
+                                                "box"}], "read_ms", "side"}, and with signs=1 (1.6.0) "signs" (an ad's
+                                                words: "url", "phone", "price", "words", "small", "ad", "why")
     GET  /status                            ->  {"model", "version", "ready", "note", "looks", "ms", "up", "spot_model",
                                                 "spot_ready", "spot_note", "spot_looks", "spot_ms", "read_model",
                                                 "read_ready", "read_note", "reads", "read_ms", "read_side_max", "ads",
                                                 "ads_note", "bench"}
-    POST /bench                             ->  starts the bench (1.5.0): bigger models timed here, one at a time
+    POST /bench[?set=all|read]              ->  starts the bench (1.5.0): bigger models timed here, one at a time;
+                                                set=read (1.6.0): the screen's words on the recordings
     GET  /bench                             ->  {"state", "note", "at", "memory_mb", "models": [{"id", "what", "size_mb",
                                                 "ms_1", "ms_3", "per_second", "load_s", "memory_mb", "note"}, ...]}
 
 Since 1.5.0 it can time bigger models on this Pi, for the ad AI's next model (the bench, started from the home
 network): each is downloaded (a fixed version, checked by its SHA-256), timed on 1 core and on 3 while no TV is
-asking, and deleted again; the models the TVs use now are timed too, to compare.
+asking, and deleted again; the models the TVs use now are timed too, to compare. Since 1.6.0 it can say what a whole
+picture's lines say of an ad (web addresses, phone numbers, prices, fine print), and the bench can read the pictures of
+his recordings (on Home media, on this Pi) to see how often each is there in the breaks and in the programs.
 """
 import base64
 import concurrent.futures
@@ -46,10 +50,12 @@ import io
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -57,7 +63,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.5.1'
+VERSION = '1.6.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -602,9 +608,9 @@ class Reader:
     """A logo's lines of letters: the detection model's map of where letters are, split into lines by the rows and
     columns where there are none, and each line read by the recognition model (its best path)."""
 
-    def __init__(self, det_path, rec_path):
+    def __init__(self, det_path, rec_path, threads=1):
         o = ort.SessionOptions()
-        o.intra_op_num_threads = 1
+        o.intra_op_num_threads = threads
         o.inter_op_num_threads = 1
         o.add_session_config_entry('session.intra_op.allow_spinning', '0')
         self.det = ort.InferenceSession(det_path, o, providers=['CPUExecutionProvider'])
@@ -622,10 +628,11 @@ class Reader:
         sx, sy = w / dw, h / dh
         out = []
         for x0, y0, x1, y1 in letter_lines(prob):
-            line = rgb.crop((int(x0 * sx), int(y0 * sy), int(np.ceil(x1 * sx)), int(np.ceil(y1 * sy))))
-            text, score = self.read_line(line)
-            if text.strip():
-                out.append({'text': text.strip(), 'score': round(score, 3)})
+            box = (int(x0 * sx), int(y0 * sy), min(w, int(np.ceil(x1 * sx))), min(h, int(np.ceil(y1 * sy))))
+            text, score = self.read_line(rgb.crop(box))
+            if text.strip():  # (1.6.0) where the line is, in parts of the picture's width and height
+                out.append({'text': text.strip(), 'score': round(score, 3),
+                            'box': [round(box[0] / w, 4), round(box[1] / h, 4), round(box[2] / w, 4), round(box[3] / h, 4)]})
         return out
 
     def read_line(self, line):
@@ -678,24 +685,31 @@ def stretches(mask, gap):
     return out
 
 
-def load_read():
-    """The reading models, from RapidOCR's package, each checked; true once they're ready."""
-    global reader
-    t0 = time.time()
+def read_paths():
+    """The reading models' files, from RapidOCR's package, each checked by its SHA-256; raises why if one can't be used."""
     spec = importlib.util.find_spec('rapidocr_onnxruntime')
     if spec is None or not spec.submodule_search_locations:
-        state['read_note'] = "the reading models' package isn't here"
-        say(state['read_note'])
-        return False
+        raise LookupError("the reading models' package isn't here")
     where = os.path.join(list(spec.submodule_search_locations)[0], 'models')
     paths = {}
     for k, (name, sha) in READ_FILES.items():
         p = os.path.join(where, name)
         if not os.path.isfile(p) or sha256(p) != sha:
-            state['read_note'] = "the reading model %s isn't the one expected (its check didn't match)" % name
-            say(state['read_note'])
-            return False
+            raise LookupError("the reading model %s isn't the one expected (its check didn't match)" % name)
         paths[k] = p
+    return paths
+
+
+def load_read():
+    """The reading models, from RapidOCR's package, each checked; true once they're ready."""
+    global reader
+    t0 = time.time()
+    try:
+        paths = read_paths()
+    except LookupError as e:
+        state['read_note'] = str(e)
+        say(state['read_note'])
+        return False
     r = Reader(paths['det'], paths['rec'])
     r.read(Image.new('RGB', (64, 32)))
     reader = r
@@ -729,6 +743,73 @@ def read_logo(data, side=READ_SIDE):
     state['reads'] += 1
     state['read_ms'] = ms if state['reads'] == 1 else state['read_ms'] * 0.9 + ms * 0.1
     return {'read_model': READ_ID, 'lines': lines, 'read_ms': round(ms), 'side': side}
+
+
+# ---- (1.6.0) An ad's words: what a whole picture's lines say that ads say and programs seldom do ----
+# Read from a whole picture (POST /read?side=N&signs=1, and the bench on the recordings): web addresses, phone numbers,
+# prices, and fine print (the small lines at the bottom: terms, offers, a drug's or a car's small print). Each is
+# counted and kept (its words) so a TV can weigh them; `ad` is whether any of the strong ones is there.
+SIGN_SCORE = 0.70        # a line read less surely than this isn't used
+SIGN_SMALL = 0.036       # a line's box under this much of the picture's height is small print (a 1080 picture: 39 points)
+SIGN_SMALL_CHARS = 12    # small print: a line of at least this many letters
+SIGN_KEPT = 4            # the signs' words kept for each kind, in an answer
+TLD = ('com|net|org|gov|edu|tv|co|io|us|info|biz|app|shop|store|health|care|law|bank|insurance|news|fm|ly|me|ca|travel'
+       '|online|site|website|club|fun|live|life|today|tech|ai|auto|cars|deals|homes')
+URL_RE = re.compile(r'(?<![a-z0-9@.-])(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9-]{1,40}(?:\.[a-z0-9-]{2,40})?\.(?:' + TLD +
+                    r')(?![a-z0-9-])(?:/[a-z0-9/_-]{1,40})?')
+PHONE_RE = re.compile(r'(?<![0-9])(?:1[\s.-]?)?\(?8(?:00|33|44|55|66|77|88)\)?[\s.-]?[0-9]{3}[\s.-]?[0-9]{4}(?![0-9])'
+                      r'|(?<![0-9])(?:1[\s.-]?8(?:00|33|44|55|66|77|88)[\s.-]|8(?:00|33|44|55|66|77|88)-)[a-z][a-z0-9-]{2,}'
+                      r'|(?<![0-9])\(?[2-9][0-9]{2}\)?[\s.-][0-9]{3}[\s.-][0-9]{4}(?![0-9])'
+                      r'|\btext\s+[a-z0-9]{2,12}\s+to\s+[0-9]{5,6}\b')
+PRICE_RE = re.compile(r'\$\s?[0-9][0-9,]*(?:\.[0-9]{2})?(?:\s?(?:/|per\s|a\s)(?:mo|month|yr|year|day|week)\b)?'
+                      r'|\b[0-9]+\.[0-9]{2}\s?/\s?mo\b|\b[0-9]+(?:\.[0-9]+)?\s?%\s?(?:apr|apy|off)\b|\bmsrp\b|\bapr\b')
+FINE_RE = re.compile(r'terms (?:and|&) conditions|terms apply|restrictions apply|conditions apply|exclusions apply'
+                     r'|see (?:store|dealer|site|website|details|terms|offer|full)|for (?:full )?details|offer (?:valid|ends|expires|good|available)'
+                     r'|limited time|while supplies last|subject to|not available in all|eligib|qualified|credit approval'
+                     r'|participating|results (?:may )?vary|individual results|professional driver|closed course|do not attempt'
+                     r'|dramati[sz]ation|simulated|actor portrayal|paid (?:actor|endorsement|spokesperson)|compensated'
+                     r'|ask your doctor|side effects|prescription|available on the app store|google play|member fdic'
+                     r'|equal housing|nmls|underwritten by|all rights reserved|free shipping|order now|call now|shop now'
+                     r'|learn more at|visit us at|apply now|sign up at|download the app|data rates may apply')
+OCR_FIX = [(re.compile(r'\s*[.,]\s*(c[o0]m|net|org|gov|edu)(?![a-z])'), r'.\1'), (re.compile(r'\.c0m'), '.com'),
+           (re.compile(r'w\s?w\s?w\s?[.,]\s?'), 'www.')]
+
+
+def sign_text(text):
+    """A line's text as the signs look at it: small letters, the reader's usual slips around web addresses mended."""
+    t = ' '.join(text.lower().split())
+    for rx, to in OCR_FIX:
+        t = rx.sub(to, t)
+    return t
+
+
+def ad_signs(lines):
+    """(1.6.0) What a whole picture's lines say of an ad: web addresses, phone numbers, prices, fine print's words, small
+    lines; `ad` if any web address, phone number or price is there, or fine print's words (two, or one with small lines)."""
+    out = {'url': [], 'phone': [], 'price': [], 'words': [], 'small': 0, 'lines': 0}
+    seen = set()
+    for ln in lines:
+        if float(ln.get('score', 0)) < SIGN_SCORE:
+            continue
+        t = sign_text(str(ln.get('text', '')))
+        if not t:
+            continue
+        out['lines'] += 1
+        box = ln.get('box')
+        small = bool(box) and len(box) == 4 and (box[3] - box[1]) < SIGN_SMALL and len(t) >= SIGN_SMALL_CHARS
+        if small:
+            out['small'] += 1
+        for kind, rx in (('url', URL_RE), ('phone', PHONE_RE), ('price', PRICE_RE), ('words', FINE_RE)):
+            for m in rx.finditer(t):
+                w = m.group(0).strip()
+                if (kind, w) not in seen:
+                    seen.add((kind, w))
+                    out[kind].append(w)
+    out['ad'] = bool(out['url'] or out['phone'] or out['price'] or (out['words'] and out['small']) or len(out['words']) >= 2)
+    out['why'] = ', '.join(k for k in ('url', 'phone', 'price', 'words') if out[k]) + (', small print' if out['small'] else '')
+    for k in ('url', 'phone', 'price', 'words'):
+        out[k] = out[k][:SIGN_KEPT]
+    return out
 
 
 def axis(n_in):
@@ -954,11 +1035,7 @@ def rec_pictures(limit=200):
     """(1.5.1) The TVs' recorded pictures (what they send for a look, 320x180 JPEGs), newest minutes first, from Home
     media on this Pi (its recordings of his channels): for setting an 8-bit copy and checking it against the original."""
     out = []
-    try:
-        with urllib.request.urlopen(MEDIA + '/rec', timeout=10) as r:
-            names = list(reversed(json.loads(r.read()).get('last') or []))
-    except Exception:
-        return out
+    names = list(reversed(rec_names()))
     for n in names:
         try:
             with urllib.request.urlopen(MEDIA + '/rec/' + urllib.parse.quote(n), timeout=60) as r:
@@ -973,25 +1050,7 @@ def rec_pictures(limit=200):
 
 def rec_jpegs(data):
     """The 'F' pictures in a recording (Home's RecFile: a kind byte, the time, then the kind's own fields)."""
-    out, i, n = [], 0, len(data)
-    while i + 9 <= n:
-        k = data[i]
-        i += 9  # the kind and the time
-        if k == 0x46:  # F: length, JPEG
-            ln = int.from_bytes(data[i:i + 4], 'big')
-            out.append(data[i + 4:i + 4 + ln])
-            i += 4 + ln
-        elif k == 0x47:  # G: width, height, length, JPEG (a full-size picture)
-            ln = int.from_bytes(data[i + 4:i + 8], 'big')
-            i += 8 + ln
-        elif k == 0x41:  # A: the sound's level
-            i += 2
-        elif k == 0x53:  # S: peak, width, flatness, bands
-            i += 6 + data[i + 5] if i + 6 <= n else n
-        elif k == 0x45:  # E: a note
-            i += 2 + int.from_bytes(data[i:i + 2], 'big')
-        else:
-            break
+    out = [data[a:a + ln] for _, _, (a, ln) in rec_records(data, 'F')]
     return [j for j in out if j[:2] == b'\xff\xd8']
 
 
@@ -1059,9 +1118,13 @@ def fidelity(src, dst, side, norm, pics, r):
 
 
 def bench_run(which='one'):
-    """Every bench model in turn: downloaded (or made), timed, deleted (the TVs' own models only timed)."""
+    """Every bench model in turn: downloaded (or made), timed, deleted (the TVs' own models only timed); or (1.6.0,
+    set=read) the screen's words on the recordings."""
     try:
-        bench_models(which)
+        if which == 'read':
+            bench_read()
+        else:
+            bench_models(which)
     except Exception as e:
         bench['note'] = 'stopped (%s)' % type(e).__name__
         say('the bench: ' + bench['note'])
@@ -1172,6 +1235,288 @@ def bench_models(which='one'):
         say('the bench: done (%s)' % bench['note'])
 
 
+# ---- (1.6.0) The bench on the recordings: what the screen's words say in the breaks and in the programs ----
+READ_BENCH_N = 120         # pictures read from the breaks, and as many from the programs (at most)
+READ_BENCH_THREADS = 2     # the bench's reader: 2 of the Pi's cores (the TVs keep the others)
+READ_BENCH_SIDE = 1280     # read as a TV would read a whole picture
+READ_BENCH_TIMED = 6       # pictures timed on the TVs' own reader (1 core), at 960 and at 1280
+BREAK_INSIDE = 2_000       # a break's picture: this far inside its screen at least (ms)
+PROGRAM_CLEAR = 30_000     # a program's picture: this far from any break's screen at least
+TEST_SCREEN = 10_000       # the PC's test screen is up this long
+BACK_CLEAR = 120_000       # a break screen taken down with Back: nothing near it counted as either
+SCREEN_RE = re.compile(r'^(.*?): the break screen (on|off): (.*)$')
+MOMENT_RE = re.compile(r'\((?:at its moment, ([0-9.]+) s ahead of the screen|its moment passed ([0-9.]+) s ago)\)$')
+PLANNED_RE = re.compile(r'planned for a picture ([0-9.]+) s ahead of the screen')
+EDGE_ON_RE = re.compile(r'; on at (the [^,;]*?), ([0-9.]+) s before its first ad picture')
+EDGE_OFF_RE = re.compile(r'; off at (the [^;(]*?)(?: \(|$|;)')
+
+
+def rec_names():
+    """(1.6.0) Every recording on Home media, oldest first (its list since 1.0.8; an older one says its newest five)."""
+    try:
+        with urllib.request.urlopen(MEDIA + '/rec?all=1', timeout=30) as r:
+            return [f['name'] for f in json.loads(r.read()).get('files') or []]
+    except urllib.error.HTTPError:
+        pass
+    except Exception:
+        return []
+    try:
+        with urllib.request.urlopen(MEDIA + '/rec', timeout=10) as r:
+            return list(json.loads(r.read()).get('last') or [])
+    except Exception:
+        return []
+
+
+def rec_get(name):
+    with urllib.request.urlopen(MEDIA + '/rec/' + urllib.parse.quote(name), timeout=120) as r:
+        return r.read()
+
+
+def rec_records(data, kinds='FGE'):
+    """(1.6.0) A recording's records in order (Home's RecFile: a kind byte, the time, the kind's own fields), the kinds
+    asked for: ('F', t, (start, length)) a picture the TV looked at, ('G', t, (start, length, width, height)) a full-size
+    one (where its JPEG is in the data), ('E', t, text) a note. Stops at anything it doesn't know."""
+    i, n = 0, len(data)
+    while i + 9 <= n:
+        k = data[i]
+        t = int.from_bytes(data[i + 1:i + 9], 'big', signed=True)
+        i += 9
+        if k == 0x46:  # F: length, JPEG
+            ln = int.from_bytes(data[i:i + 4], 'big')
+            if 'F' in kinds:
+                yield 'F', t, (i + 4, ln)
+            i += 4 + ln
+        elif k == 0x47:  # G: width, height, length, JPEG
+            ln = int.from_bytes(data[i + 4:i + 8], 'big')
+            if 'G' in kinds:
+                yield 'G', t, (i + 8, ln, int.from_bytes(data[i:i + 2], 'big'), int.from_bytes(data[i + 2:i + 4], 'big'))
+            i += 8 + ln
+        elif k == 0x41:  # A: the sound's level
+            i += 2
+        elif k == 0x53:  # S: peak, width, flatness, bands
+            i += 6 + data[i + 5] if i + 6 <= n else n
+        elif k == 0x45:  # E: a note
+            ln = int.from_bytes(data[i:i + 2], 'big')
+            if 'E' in kinds:
+                yield 'E', t, data[i + 2:i + 2 + ln].decode('utf-8', 'replace')
+            i += 2 + ln
+        else:
+            break
+
+
+def screen_moment(t, rest):
+    """When a break screen note's change was seen: its moment ahead of (or passed before) the note, else at once."""
+    m = MOMENT_RE.search(rest)
+    if not m:
+        return t
+    return t + int(float(m.group(1)) * 1000) if m.group(1) else t - int(float(m.group(2)) * 1000)
+
+
+def edge_kind(rest, on):
+    """(2.05's notes) Where a break screen's change was put: to a cut (by the logo, the sound, the only one, an end card),
+    by a silence or black picture, or at the AI's picture as before."""
+    m = (EDGE_ON_RE if on else EDGE_OFF_RE).search(rest)
+    if m:
+        w = m.group(1)
+        return ('logo' if 'logo' in w else 'sound' if 'sound' in w else 'only cut' if 'only cut' in w
+                else 'end card' if 'end card' in w else 'cut'), (float(m.group(2)) if on else None)
+    low = rest.lower()
+    if 'silen' in low or 'black' in low:
+        return 'silence or black', None
+    return 'picture', None
+
+
+def rec_breaks(notes):
+    """The breaks in the recordings' notes [(time, text)], in order: the screens' spans [(on, off, channel)], the spans
+    to leave out (the PC's tests, Back), where each change was put since 2.05, and the channels' changes."""
+    spans, skip, edges = [], [], {'on': {}, 'off': {}, 'before_s': []}
+    on_at, on_ch, cur = None, None, None
+    for t, text in notes:
+        if text.startswith('channel '):  # each minute's recording starts with it
+            ch = text[len('channel '):]
+            if ch != cur and on_at is not None:  # another channel with a break on: that break ends there
+                spans.append((on_at, t, on_ch))
+                on_at = None
+            cur = ch
+            continue
+        if 'the break screen taken down (Back)' in text:
+            skip.append((t - BACK_CLEAR, t + BACK_CLEAR))
+            continue
+        m = SCREEN_RE.match(text)
+        if not m:
+            if ': left after ' in text and on_at is not None:
+                spans.append((on_at, t, on_ch))
+                on_at = None
+            continue
+        ch, which, rest = m.group(1), m.group(2), m.group(3)
+        if rest.startswith('a test from the PC'):
+            if 'not now' not in rest:
+                p = PLANNED_RE.search(rest)
+                at = t + (int(float(p.group(1)) * 1000) if p else 0)
+                skip.append((at - BREAK_INSIDE, at + TEST_SCREEN + BREAK_INSIDE))
+            continue
+        at = screen_moment(t, rest)
+        kind, before = edge_kind(rest, which == 'on')
+        edges[which][kind] = edges[which].get(kind, 0) + 1
+        if before is not None and len(edges['before_s']) < 200:
+            edges['before_s'].append(round(before, 2))
+        if which == 'on':
+            if on_at is None:
+                on_at, on_ch = at, ch
+        elif on_at is not None:
+            spans.append((on_at, max(at, on_at), on_ch))
+            on_at = None
+    return spans, skip, edges, on_at
+
+
+def pick_even(items, n):
+    """N of the items, spread evenly over them (all of them if there are no more)."""
+    if len(items) <= n:
+        return list(items)
+    return [items[int(i * len(items) / n)] for i in range(n)]
+
+
+HEIGHTS = (0.02, 0.025, 0.03, 0.036, 0.045, 0.06)  # the long lines' heights counted between these (parts of the picture)
+
+
+def read_bench_add(stats, label, signs, ms, lines=()):
+    s = stats[label]
+    s['read'] += 1
+    s['ms'].append(ms)
+    for ln in lines:  # how high its long lines are (small print's line, set from these)
+        b = ln.get('box')
+        if b and float(ln.get('score', 0)) >= SIGN_SCORE and len(sign_text(str(ln.get('text', '')))) >= SIGN_SMALL_CHARS:
+            k = sum(1 for x in HEIGHTS if b[3] - b[1] >= x)
+            s['heights'][k] += 1
+    if signs['lines']:
+        s['with_words'] += 1
+    for k in ('url', 'phone', 'price', 'words'):
+        if signs[k]:
+            s[k] += 1
+            for w in signs[k]:
+                ex = s['examples'].setdefault(k, [])
+                if w not in ex and len(ex) < 25:
+                    ex.append(w)
+    if signs['small']:
+        s['small'] += 1
+    if signs['ad']:
+        s['ad'] += 1
+
+
+def read_bench_view(stats):
+    out = {}
+    for label, s in stats.items():
+        n = max(1, s['read'])
+        ms = sorted(s['ms'])
+        out[label] = {'read': s['read'], 'share': {k: round(s[k] / n, 3) for k in ('ad', 'url', 'phone', 'price', 'words', 'small', 'with_words')},
+                      'long_lines_by_height': dict(zip(['under 2%'] + ['%g%% up' % (x * 100) for x in HEIGHTS], s['heights'])),
+                      'ms': {'mean': round(sum(ms) / len(ms)) if ms else None, 'p90': ms[int(len(ms) * 0.9)] if ms else None},
+                      'examples': s['examples']}
+    return out
+
+
+def bench_read():
+    """(1.6.0) The screen's words on his recordings: pictures from the breaks (where the TV's break screen was up) and
+    from the programs (well away from any) read as a TV reads a whole picture, and how often each ad sign is there in
+    each; where 2.05's break screens were put (to a cut by the logo, the sound, the only cut; by a silence or black; at
+    the AI's picture); the TVs' own reading timed. Numbers and the signs' words only: no picture is kept."""
+    with bench_lock:
+        bench.update({'state': 'running', 'note': '', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'models': [], 'set': 'read',
+                      'memory_mb': round((meminfo('MemTotal') or 0) / 1e6), 'cores': os.cpu_count()})
+        r = bench['read'] = {'now': 'listing the recordings'}
+        say('the bench (read): started')
+        if not state['read_ready']:
+            raise RuntimeError('the reading models are not ready')
+        names = rec_names()
+        r.update({'recordings': len(names), 'now': 'reading the notes'})
+        notes, fulls, size = [], [], 0
+        for i, name in enumerate(names):
+            r['now'] = 'reading the notes (%d of %d recordings)' % (i + 1, len(names))
+            try:
+                data = rec_get(name)
+            except Exception:
+                continue
+            size += len(data)
+            for k, t, v in rec_records(data, 'GE'):
+                if k == 'E':
+                    notes.append((t, v))
+                else:
+                    fulls.append((t, name))
+            del data
+        notes.sort(key=lambda x: x[0])
+        spans, skip, edges, open_on = rec_breaks(notes)
+        fulls.sort()
+        in_break, in_program = [], []
+        for t, name in fulls:
+            if any(a <= t <= b for a, b in skip):
+                continue
+            if any(on + BREAK_INSIDE <= t <= off - BREAK_INSIDE for on, off, _ in spans):
+                in_break.append((t, name))
+            elif all(t < on - PROGRAM_CLEAR or t > off + PROGRAM_CLEAR for on, off, _ in spans) and \
+                    (open_on is None or t < open_on - PROGRAM_CLEAR):
+                in_program.append((t, name))
+        r.update({'bytes': size, 'full_pictures': len(fulls), 'breaks': len(spans),
+                  'break_minutes': round(sum(off - on for on, off, _ in spans) / 60000, 1),
+                  'hours': round((fulls[-1][0] - fulls[0][0]) / 3600000, 1) if fulls else 0,
+                  'edges': edges, 'candidates': {'break': len(in_break), 'program': len(in_program)}})
+        chosen = [(t, name, 'break') for t, name in pick_even(in_break, READ_BENCH_N)] + \
+                 [(t, name, 'program') for t, name in pick_even(in_program, READ_BENCH_N)]
+        by_file = {}
+        for t, name, label in chosen:
+            by_file.setdefault(name, {})[t] = label
+        paths = read_paths()
+        bench_reader = Reader(paths['det'], paths['rec'], READ_BENCH_THREADS)
+        stats = {lb: {'read': 0, 'ms': [], 'with_words': 0, 'url': 0, 'phone': 0, 'price': 0, 'words': 0, 'small': 0,
+                      'ad': 0, 'examples': {}, 'heights': [0] * (len(HEIGHTS) + 1)} for lb in ('break', 'program')}
+        program_ads, timed_jpegs, done = [], [], 0
+        for name in sorted(by_file):
+            want = by_file[name]
+            try:
+                data = rec_get(name)
+            except Exception:
+                continue
+            for k, t, (start, ln, w, h) in rec_records(data, 'G'):
+                label = want.get(t)
+                if label is None:
+                    continue
+                jpg = bytes(data[start:start + ln])
+                done += 1
+                r['now'] = 'reading picture %d of %d' % (done, len(chosen))
+                try:
+                    t0 = time.time()
+                    lines = bench_reader.read(Image.open(io.BytesIO(jpg)), READ_BENCH_SIDE)
+                    ms = round((time.time() - t0) * 1000)
+                except Exception:
+                    continue
+                signs = ad_signs(lines)
+                read_bench_add(stats, label, signs, ms, lines)
+                if label == 'program' and signs['ad'] and len(program_ads) < 30:
+                    program_ads.append({'at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t / 1000)), 'recording': name,
+                                        'why': signs['why']})
+                if len(timed_jpegs) < READ_BENCH_TIMED and label == 'break':
+                    timed_jpegs.append(jpg)
+                r['result'] = read_bench_view(stats)
+            del data
+        r['program_with_ad_signs'] = program_ads
+        r['now'] = "timing the TVs' own reading (1 core)"
+        live, asked = {}, False
+        for side in (960, 1280):
+            ms = []
+            for jpg in timed_jpegs:
+                asked = asked or time.time() - state['last_look'] < BENCH_QUIET
+                with read_lock:
+                    t0 = time.time()
+                    reader.read(Image.open(io.BytesIO(jpg)), side)
+                    ms.append(round((time.time() - t0) * 1000))
+            live[str(side)] = round(sum(ms) / len(ms)) if ms else None
+        r['tv_reader_ms'] = live
+        r['tv_asking_meanwhile'] = asked or time.time() - state['last_look'] < BENCH_QUIET
+        r['result'] = read_bench_view(stats)
+        r['now'] = 'done'
+        bench['state'] = 'done'
+        say('the bench (read): done, %d pictures read' % done)
+
+
 def home_network(addr):
     try:
         ip = ipaddress.ip_address(addr)
@@ -1215,7 +1560,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(409, {'note': 'the bench is already running', 'bench': bench_view()})
             if not state['ready']:
                 return self.reply(503, {'note': 'not until the main model is ready'})
-            which = 'all' if 'set=all' in query.split('&') else 'one'
+            asked = query.split('&')
+            which = 'all' if 'set=all' in asked else 'read' if 'set=read' in asked else 'one'
+            if which == 'read' and not state['read_ready']:
+                return self.reply(503, {'note': 'not until the reading models are ready'})
             bench['state'] = 'running'
             bench['busy'] = 'busy=1' in query.split('&')
             threading.Thread(target=bench_run, args=(which,), daemon=True).start()
@@ -1243,9 +1591,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 return self.reply(400, {'note': 'side: a number of points, 256 to 1280'})
             try:
-                return self.reply(200, read_logo(body, side))
+                answer = read_logo(body, side)
             except Exception as e:
                 return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
+            if 'signs=1' in query.split('&'):  # (1.6.0) what its lines say of an ad
+                answer['signs'] = ad_signs(answer['lines'])
+            return self.reply(200, answer)
         if path != '/look':
             return self.reply(404, {'note': 'POST /look, POST /read or POST /ads'})
         box = None

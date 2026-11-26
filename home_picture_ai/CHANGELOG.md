@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.0
+
+- An ad's words: `POST /read?side=N&signs=1` reads a whole picture and says what its lines say of an ad (`signs`): web
+  addresses, phone numbers, prices, and fine print (its usual words: terms, offers, a car's or a drug's small print;
+  and small lines), each with the words found, and `ad` when any of the strong ones is there. Each line read now says
+  where it is too (`box`: its left, top, right and bottom, in parts of the picture's width and height).
+- The bench on the recordings (`POST /bench?set=read`): pictures from the breaks (where a TV's break screen was up) and
+  from the programs (well away from any) in his recordings on Home media are read as a TV reads a whole picture, and it
+  says how often each sign was there in each (with the words found), how high their long lines are, and which program
+  pictures had an ad's words (maybe a break the screen missed). It also says where Home 2.05 put each break screen's
+  change (to a cut, by the channel's logo, the sound or the only cut; by a silence or black picture; or at the AI's
+  picture), and times the TVs' own reader at 960 and 1280. Numbers and the signs' words only: no picture is kept.
+- Reads every recording on Home media (its list since 1.0.8), not only the newest five.
+
 ## 1.5.1
 
 - The bench for one TV at a time (the default; `POST /bench?set=all` is 1.5.0's): what counts is how many pictures a
