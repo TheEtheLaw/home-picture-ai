@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -449,7 +449,8 @@ class Item:
                 continue
             if self.prefetch and others_busy(self):
                 self.state = 'waiting (the one playing first)'
-                time.sleep(5)
+                with self.cond:
+                    self.cond.wait(5)  # woken at once when it's the one played (a TV asks for it)
                 continue
             self.state = 'downloading'
             try:

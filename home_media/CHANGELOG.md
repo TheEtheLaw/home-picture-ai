@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4
+
+- The next episode, waiting to come in ahead of time, starts coming in the moment a TV plays it (it could wait up to 5 s).
+
 ## 1.0.3
 
 - A file once watched stops coming in at once (it went on to the end before, alongside the next episode); played again,
