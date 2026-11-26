@@ -9,6 +9,11 @@ Announced on the home network (mDNS, _homemedia._tcp, port 8766), so the TVs fin
 The drive is the app's own: labelled HOMEMEDIA (ext4), mounted inside this app only, never Home Assistant's storage.
 With no drive, nothing is written anywhere: the TVs play from the source as before. A new drive is formatted once,
 when the app's option says so. Links are kept in memory only: never logged, never written down.
+
+Since 1.0.7 it also keeps the ad watch's recordings, from a TV whose recording is turned on (for tuning the ad AI on
+his own channels): each minute's file as the TV sends it (pictures, the sound's levels, the watch's notes; never a
+link), in home-recordings on the drive, REC_MAX at most with the oldest going first, and never at the expense of what
+the TVs play (the drive running low, recordings go before any film or episode). Nothing leaves the home network.
 """
 import base64
 import hashlib
@@ -23,9 +28,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-VERSION = '1.0.6'
+VERSION = '1.0.7'
 PORT = 8766
 LABEL = 'HOMEMEDIA'
 TEST_ROOT = os.environ.get('HOME_MEDIA_TEST_ROOT')  # (tests off the Pi) a folder instead of the drive
@@ -41,6 +47,11 @@ KEEP_FREE = int(os.environ.get('HOME_MEDIA_KEEP_FREE', 50 << 30))  # kept free o
 MIN_DRIVE = 100 << 30      # never formats anything smaller (a stray USB stick)
 WAIT = 60                  # a TV waits this long for a part before its connection ends (it asks again)
 RUNNING = 2                # files downloading at once (the one playing, and the next episode's)
+# (1.0.7) The ad watch's recordings: a minute's file each, under REC_DIR by day, REC_MAX in all (the oldest go first).
+REC_DIR = os.path.join(MOUNT, 'home-recordings')
+REC_MAX = int(os.environ.get('HOME_MEDIA_REC_MAX', 150 << 30))
+REC_BODY_MAX = 256 << 20   # a minute's file with full-size pictures is about 20 MB
+REC_NAME = re.compile(r'^(\d{8})-\d{6}-[A-Za-z0-9]{0,60}(-\d{1,3})?\.rec$')
 
 
 def say(msg):
@@ -780,6 +791,7 @@ def tidy():
             why = 'unused for %g days' % keep_days
         if why:
             forget(it, why)
+    rec_tidy()  # (1.0.7) recordings go before anything the TVs play
     free, total = drive.free()
     if total and free < KEEP_FREE:
         # Never one being played or coming in: only what's idle, oldest first.
@@ -803,6 +815,147 @@ def tidy():
                 os.remove(os.path.join(DIR, f))
     except Exception:
         pass
+
+
+# ---- The ad watch's recordings (1.0.7) ----
+
+rec_lock = threading.Lock()
+rec_newest = []  # what the newest few files hold (for a check): [{name, bytes, pictures, full, full_size, levels, notes}]
+
+
+def rec_files():
+    """The recordings on the drive, oldest first: [(path, name, bytes)]."""
+    out = []
+    try:
+        days = sorted(d for d in os.listdir(REC_DIR) if re.match(r'^\d{8}$', d))
+    except OSError:
+        return out
+    for d in days:
+        folder = os.path.join(REC_DIR, d)
+        try:
+            names = sorted(n for n in os.listdir(folder) if REC_NAME.match(n))
+        except OSError:
+            continue
+        for n in names:
+            path = os.path.join(folder, n)
+            try:
+                out.append((path, n, os.path.getsize(path)))
+            except OSError:
+                pass
+    return out
+
+
+def rec_drop(path):
+    try:
+        os.remove(path)
+        folder = os.path.dirname(path)
+        if not os.listdir(folder):
+            os.rmdir(folder)
+        return True
+    except OSError:
+        return False
+
+
+def rec_room(need):
+    """Makes room for NEED more bytes: within REC_MAX, and the drive kept KEEP_FREE free (the oldest recordings go).
+    False if there can't be room (the drive full of what the TVs play)."""
+    files = rec_files()
+    total = sum(f[2] for f in files)
+    while files and total + need > REC_MAX:
+        path, _, size = files.pop(0)
+        if rec_drop(path):
+            total -= size
+    free, size = drive.free()
+    while size and files and free - need < KEEP_FREE:
+        path, _, n = files.pop(0)
+        if rec_drop(path):
+            free += n
+    free, size = drive.free()
+    return total + need <= REC_MAX and (not size or free - need >= KEEP_FREE)
+
+
+def rec_scan(data):
+    """What a recording file holds (its records one after another: a byte saying what, the time, then its part)."""
+    k = {'pictures': 0, 'full': 0, 'full_size': '', 'levels': 0, 'looks': 0, 'notes': 0}
+    i, n = 0, len(data)
+    try:
+        while i + 9 <= n:
+            kind = data[i]
+            i += 9
+            if kind == ord('F'):
+                ln = int.from_bytes(data[i:i + 4], 'big')
+                i += 4 + ln
+                k['pictures'] += 1
+            elif kind == ord('G'):
+                w = int.from_bytes(data[i:i + 2], 'big')
+                h = int.from_bytes(data[i + 2:i + 4], 'big')
+                ln = int.from_bytes(data[i + 4:i + 8], 'big')
+                i += 8 + ln
+                k['full'] += 1
+                k['full_size'] = '%dx%d' % (w, h)
+            elif kind == ord('A'):
+                i += 2
+                k['levels'] += 1
+            elif kind == ord('S'):
+                bands = data[i + 5] if i + 5 < n else 0
+                i += 6 + bands
+                k['looks'] += 1
+            elif kind == ord('E'):
+                ln = int.from_bytes(data[i:i + 2], 'big')
+                i += 2 + ln
+                k['notes'] += 1
+            else:
+                break
+    except IndexError:
+        pass
+    k['whole'] = i == n
+    return k
+
+
+def rec_keep(name, data):
+    """A TV's minute of recording, kept on the drive (another with the same name gets a number)."""
+    m = REC_NAME.match(name or '')
+    if not m:
+        raise ValueError('not a recording\'s name')
+    with rec_lock:
+        if not rec_room(len(data)):
+            return None
+        folder = os.path.join(REC_DIR, m.group(1))
+        os.makedirs(folder, exist_ok=True)
+        base, path, k = name[:-4], os.path.join(folder, name), 1
+        while os.path.exists(path) and k < 100:
+            k += 1
+            path = os.path.join(folder, '%s-%d.rec' % (base, k))
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, path)
+        info = rec_scan(data)
+        info.update({'name': os.path.basename(path), 'bytes': len(data)})
+        rec_newest.append(info)
+        del rec_newest[:-5]
+        return info
+
+
+def rec_summary():
+    files = rec_files()
+    with rec_lock:
+        newest = list(rec_newest)
+    return {'files': len(files), 'bytes': sum(f[2] for f in files), 'max': REC_MAX, 'newest': newest,
+            'last': [f[1] for f in files[-5:]]}
+
+
+def rec_tidy():
+    """The drive running low: recordings go first (oldest first), before anything the TVs play."""
+    free, size = drive.free()
+    if not size or free >= KEEP_FREE:
+        return
+    with rec_lock:
+        for path, _, n in rec_files():
+            if rec_drop(path):
+                free += n
+            if free >= KEEP_FREE:
+                break
 
 
 def forget(it, why):
@@ -851,7 +1004,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                                  'free': free, 'size': total}, 'files': files})
         if self.path.startswith('/play/'):
             return self.play(head=False)
+        if self.path == '/rec':
+            return self.answer(200, rec_summary())
+        if self.path.startswith('/rec/'):
+            return self.rec_file()
         self.answer(404, {'error': 'not here'})
+
+    def rec_file(self):
+        """(1.0.7) One recording, as it was sent (for tuning the ad AI at home)."""
+        name = self.path[len('/rec/'):]
+        m = REC_NAME.match(name)
+        path = os.path.join(REC_DIR, m.group(1), name) if m else None
+        if not path or not os.path.isfile(path):
+            return self.answer(404, {'error': 'not here'})
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(size))
+        self.end_headers()
+        with open(path, 'rb') as f:
+            while True:
+                b = f.read(BLOCK)
+                if not b:
+                    break
+                self.wfile.write(b)
+
+    def rec_post(self):
+        """(1.0.7) A TV's minute of recording: POST /rec?name=NAME, the file as the body."""
+        try:
+            n = int(self.headers.get('Content-Length') or -1)
+        except ValueError:
+            n = -1
+        if n < 0 or n > REC_BODY_MAX:
+            self.close_connection = True
+            return self.answer(413 if n > REC_BODY_MAX else 411, {'error': 'its length'})
+        q = urllib.parse.parse_qs(self.path.partition('?')[2])
+        name = (q.get('name') or [''])[0]
+        data = b''
+        left = n
+        parts = []
+        while left > 0:
+            b = self.rfile.read(min(BLOCK, left))
+            if not b:
+                break
+            parts.append(b)
+            left -= len(b)
+        data = b''.join(parts)
+        if left:
+            self.close_connection = True
+            return self.answer(400, {'error': 'cut short'})
+        if not drive.ok:
+            return self.answer(503, {'error': 'no drive', 'why': drive.why})
+        try:
+            info = rec_keep(name, data)
+        except ValueError as e:
+            return self.answer(400, {'error': str(e)})
+        except OSError as e:
+            return self.answer(500, {'error': 'not written (%s)' % e.__class__.__name__})
+        if info is None:
+            return self.answer(507, {'error': 'no room'})
+        return self.answer(200, info)
 
     def do_HEAD(self):
         if not self.allowed():
@@ -865,6 +1077,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
+        if self.path.startswith('/rec?') or self.path == '/rec':
+            return self.rec_post()
         try:
             n = int(self.headers.get('Content-Length') or 0)
             body = json.loads(self.rfile.read(n) or b'{}') if n else {}

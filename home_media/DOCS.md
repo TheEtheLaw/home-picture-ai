@@ -39,6 +39,11 @@ that starts by itself at the end doesn't take it away); a watched film goes the 
 anything nobody has played for the days above goes; and the oldest go first when the drive has less than 50 GB free.
 Files being played or coming in are never removed.
 
+The ad watch's recordings, from a TV whose recording is turned on (for tuning the ad AI on your own channels): each
+minute as the TV sends it (its pictures, the sound's levels and the watch's notes; never a link), in
+`home-recordings` on the drive, 150 GB at most with the oldest going first. When the drive has less than 50 GB free,
+recordings go first, before any film or episode.
+
 Links are kept in memory only: never logged, never written to the drive or anywhere else. After a restart, a file that
 wasn't all in waits until a TV asks for it again with its link. The app only answers devices on the home network
 (private addresses), and its log says what comes in by name only.
@@ -58,5 +63,8 @@ Announced on the home network as `_homemedia._tcp`, port 8766.
   episodes before it go (when no TV is reading them). `/get` takes the same three, for an episode.
   With `"why": "dropped"`: it isn't wanted any more (another copy was picked); its download stops at once, and it goes
   at once when no TV is reading it.
+- `POST /rec?name=<name>` with a recording's minute as the body: kept on the drive (a name used already gets a
+  number). Answers what it holds (`pictures`, `full` full-size pictures and their `full_size`, `levels`, `notes`).
+- `GET /rec`: how many recordings there are, their size, and what the newest hold; `GET /rec/<name>`: one of them.
 - `GET /status`: the drive (ready or why not, its size and free space) and the files (size, how much is in and which
   parts, how fast it's coming in, state). The watchdog uses it; Home's player bar shows the parts.

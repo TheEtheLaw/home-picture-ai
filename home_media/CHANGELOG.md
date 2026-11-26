@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.7
+
+- Keeps the ad watch's recordings from a TV whose recording is turned on (for tuning the ad AI on your own channels):
+  each minute's file as the TV sends it (`POST /rec?name=...`), in `home-recordings` on the drive, 150 GB at most, the
+  oldest going first. When the drive runs low, recordings go before anything the TVs play. `GET /rec` says how many
+  there are and what the newest hold.
+
 ## 1.0.6
 
 - Each file in the list says which parts of it are in (`spans`: byte ranges, at most 32), so Home's player bar can
