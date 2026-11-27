@@ -10,6 +10,9 @@ here) so the TVs don't have to.
 - **Home media**: the media server. It downloads what the TVs play onto its own USB drive and plays it to them from
   there, so every jump is instant, and gets the next episode ready ahead of time. More in
   [home_media/DOCS.md](home_media/DOCS.md).
+- **Home guide**: a TV guide for the channels the TVs ask for, the ones their providers' guides don't cover well. It
+  matches each channel by its name to a TV listing site's and reads their next two days each day with the iptv-org
+  EPG grabber. More in [home_guide/DOCS.md](home_guide/DOCS.md).
 
 ## Installing
 
@@ -31,3 +34,7 @@ kind, and TV programs (sports, news, shows, films).
 
 Home media uses Python's own library, Debian's drive tools (util-linux, e2fsprogs) and python-zeroconf (LGPL-2.1),
 each as published.
+
+Home guide uses Python's own library, Node.js, and the [iptv-org EPG grabber](https://github.com/iptv-org/epg) (public
+domain, under the Unlicense), which it fetches on its first start and brings up to date each day; the shows come from
+the TV listing sites it reads.
