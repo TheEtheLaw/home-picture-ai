@@ -75,7 +75,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.9.0'
+VERSION = '1.9.1'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -2067,7 +2067,9 @@ class LookLog:
         e = a[:, 12:].copy().view(np.int8).astype(np.float32) * scale[:, None]
         e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-9)
         order = np.argsort(t, kind='stable')
-        return t[order], e[order]
+        t, e = t[order], e[order]
+        keep = np.r_[True, np.diff(t) != 0] if len(t) else np.zeros(0, bool)  # (1.9.1) a picture sent twice: once
+        return t[keep], e[keep]
 
 
 looklog = LookLog()
@@ -2124,7 +2126,7 @@ def lesson_events(key, days):
                 screens.append((int(ev['from']), int(ev['to'])))
             elif ev.get('kind') == 'show':
                 shows.append((int(ev['at']), str(ev.get('name') or '')))
-    return sorted(runs), sorted(screens), sorted(shows)
+    return sorted(set(runs)), sorted(set(screens)), sorted(set(shows))  # (1.9.1) a word sent twice: once
 
 
 def in_spans(t, spans):

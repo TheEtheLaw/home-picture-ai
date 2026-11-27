@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.1
+
+- A channel's pictures or words sent twice (a recording replayed to teach it again) count once.
+
 ## 1.9.0
 
 - Each channel's own lesson. A TV can say which channel a picture is of and when (`POST /look?ch=NAME&t=MS`), and how
