@@ -75,6 +75,30 @@ line, and how many pictures) and `probe_from_auc`; for the TVs' model now also `
 the TVs use now) and `words_like_now` (how like that lean the words' is); and `ms`, its time for a picture on all
 cores. Text halves and new models are downloaded (fixed versions, checked by SHA-256) and deleted after.
 
+## Each channel's own lesson (since 1.9.0)
+
+The AI's lean is the same for every channel, but each channel's ads and programs look their own way, and a lean learned
+from a channel's own breaks parts them much better. So a TV says which channel each picture is of and the picture's own
+time (`POST /look?ch=NAME&t=MS`), and tells the app how each run of the AI's ads on it ended (real or not, and why), when
+its screen was up and which show was on (`POST /lessons/event` with `{"channel", "kind": "run", "from", "to", "real",
+"why"}`, `{"channel", "kind": "screen", "from", "to"}` or `{"channel", "kind": "show", "at", "name"}`). What the AI saw
+of each picture (its 512 numbers, a byte each, never the picture) is kept by channel for 21 days, a file a day; the
+words too. A replay's (`replay=1` with either) are not kept.
+
+Each night, once no TV has asked for half an hour and 20 hours after the last time, each channel's lesson is learned
+again: its ad pictures from inside its real breaks (their first and last 10 seconds left out), its program pictures at
+least 40 seconds from any run of the AI's ads and any screen, one each 4 seconds. Before a lesson is used it's tested on
+the newest day it didn't learn from (with no other day yet, a long day's later part): its AUC at least 0.97, 85% of
+that day's ad pictures over its line (the line lets 2% of the program over), the screen it would put up (3 ad words in
+a row start it, 2 of the program end it) covering at least 80% of the real breaks and up outside them at most 30
+seconds an hour. A show watched at least 15 minutes with more than 60 seconds an hour of it outside real breaks is held
+(the TV goes by its own rules there). A channel whose own lesson hasn't passed can use another channel's that passes
+this channel's own test (the same channel from another provider, a sister channel), at most a quarter of its watching
+held. A lesson in use goes with every answer for its channel: `"lesson": {"score", "line", "from", "held"}` (`from`:
+`own` or the channel it's from). `GET /lessons` says how each channel's went (learned, tested, used or not, why) and
+what's kept; `POST /lessons/learn[?before=MS][&channels=A,B]` learns now (a test can learn from what came before a
+time). Another main model starts the lessons over.
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how

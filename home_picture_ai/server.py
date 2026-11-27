@@ -16,7 +16,10 @@ remembers the ads the TVs have seen: once a TV's ad screen has covered a break, 
 the AI's fingerprints of the ads in it (512 numbers each, never a picture), each is kept once, and every answer says
 how like the nearest remembered ad the picture is, so an ad seen before is known on any channel and either TV.
 Nothing leaves the home network: the pictures are looked at and forgotten, never kept or logged; the ads' fingerprints
-are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp) so the TVs find it.
+are kept in the app's own storage. Since 1.9.0 each channel has its own lesson: what the AI saw of a channel's pictures
+(its numbers, never the pictures) is kept 21 days, and each night a lean is learned from the channel's own real breaks
+and tested on a day it didn't learn from before it's used (see DOCS.md). Announced on the network (mDNS, _homeai._tcp)
+so the TVs find it.
 
     POST /look[?spot=x0,y0,x1,y1]   a JPEG  ->  {"model", "score", "embedding" (512 float32, base64), "ad", "like",
                                                 "sure", "known", "ms"}, and for a spot {"spot_model", "spot", "spot_like",
@@ -37,6 +40,11 @@ are kept in the app's own storage. Announced on the network (mDNS, _homeai._tcp)
                                                 set=read (1.6.0): the screen's words on the recordings
     GET  /bench                             ->  {"state", "note", "at", "memory_mb", "models": [{"id", "what", "size_mb",
                                                 "ms_1", "ms_3", "per_second", "load_s", "memory_mb", "note"}, ...]}
+    POST /look?ch=NAME&t=MS[&replay=1]      (1.9.0) the same, the channel's lesson in it ("lesson": {"score", "line",
+                                                "from", "held"}) while one is in use; what the AI saw kept by channel
+    POST /lessons/event[?replay=1]          {"channel", "kind": "run"|"screen"|"show", ...}  ->  {"kept"}
+    GET  /lessons                           ->  each channel's lesson: learned, tested, used or not, why; what's kept
+    POST /lessons/learn[?before=MS][&channels=A,B]  ->  learns now
 
 Since 1.5.0 it can time bigger models on this Pi, for the ad AI's next model (the bench, started from the home
 network): each is downloaded (a fixed version, checked by its SHA-256), timed on 1 core and on 3 while no TV is
@@ -56,6 +64,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -66,7 +75,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.8.0'
+VERSION = '1.9.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -921,7 +930,7 @@ def spot_look(rgb, box):
             'spot': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
 
 
-def look(jpeg, box=None):
+def look(jpeg, box=None, ch=None, t=None, replay=False):
     im = Image.open(io.BytesIO(jpeg))
     if im.width * im.height > MAX_PIXELS:
         raise ValueError('too big')
@@ -938,6 +947,16 @@ def look(jpeg, box=None):
     state['ms'] = ms if state['looks'] == 1 else state['ms'] * 0.95 + ms * 0.05
     out = {'model': MODEL_ID, 'score': float(e @ direction), 'ad': AD, 'like': LIKE, 'sure': SURE, 'ms': round(ms),
            'known': round(ads.known(e), 4), 'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
+    key = lesson_key(ch)
+    if key:  # (1.9.0) the channel's: what the AI saw kept for its lesson (not a replay's), and its lesson's word
+        if t is not None and not replay:
+            try:
+                looklog.add(key, t, e)
+            except Exception as ex:
+                state['lesson_note'] = "couldn't keep what it saw (%s)" % type(ex).__name__
+        la = lesson_answer(key, e)
+        if la is not None:
+            out['lesson'] = la
     if spot is not None:
         try:
             out.update(spot.result(timeout=5))
@@ -1926,6 +1945,601 @@ def score_run(spec):
         say('the bench (score): done (%s)' % bench['note'])
 
 
+# ---- (1.9.0) Each channel's own lesson: what its breaks look like, learned from its own confirmed breaks ----
+# The AI's lean is the same for every channel; but a channel's ads and its programs each look their own way, and a lean
+# learned from a channel's own breaks parts them far better (on FS1's afternoon, one learned from its first half caught
+# 98% of the second half's ad pictures with 2% of the game's taken for ads). So the TVs say which channel each picture
+# is of and when (POST /look?ch=&t=), and how each run of the AI's ads ended (a real break: a silent or black cut at its
+# start, ads seen before, an ad's words; or not), when the screen was up and which show was on (POST /lessons/event).
+# What the AI saw of each picture (its 512 numbers, never the picture) is kept by channel for LESSON_DAYS days. Each
+# night (once the TVs have been quiet a while), each channel's lesson is learned again: ad pictures from its real
+# breaks, program pictures well away from any run of the AI's ads or any screen. Before a lesson is used it's tested
+# on the newest day it didn't learn from: it must part that day's breaks from its program, and the screen it would put
+# up must cover the real breaks and stay off the program (a show it can't keep off is held, and goes by the TV's rules).
+# A channel whose own lesson hasn't passed may borrow another channel's, if that one passes this channel's own test
+# (the same channel from another provider, a sister channel). A lesson that passed goes with every answer for its
+# channel; the TV gives the AI its freedom there.
+LESSONS = os.path.join(DATA, 'lessons')
+LESSON_DAYS = 21            # the AI's numbers and the TVs' events kept this many days
+LESSON_DAY_SHIFT = 10       # a day ends at 10:00 UTC (5 AM in New York, 2 AM in Los Angeles)
+LESSON_EVERY = 4000         # ms between two pictures of an answer, to learn from
+LESSON_TRIM = 10_000        # a real break's first and last 10 s left out (where the AI's run began and ended)
+LESSON_AWAY = 40_000        # the program: at least this far from any run of the AI's ads and any screen
+LESSON_NEAR = 20_000        # a screen this near a real break is that break's
+LESSON_GAP = 10_000         # pictures further apart than this aren't one stretch of watching
+LESSON_RUN_START, LESSON_RUN_END = 3, 2  # as the TV: 3 ad words in a row start a run, 2 of the program end it
+LESSON_FP = 0.02            # its line: 2% of the program's pictures over it
+# To pass: it parts the test day's breaks from its program, its screen covers the real breaks, and it puts the screen
+# up outside them at most PASS_FALSE seconds an hour; a show watched at least HOLD_LEAST minutes with more than
+# HOLD_FALSE seconds an hour of it is held (the TV's rules there).
+PASS_AUC, PASS_CAUGHT, PASS_COVER, PASS_FALSE = 0.97, 0.85, 0.8, 30
+HOLD_FALSE, HOLD_LEAST = 60, 15
+LEAST_BREAKS, LEAST_PROGRAM = 2, 300        # a test: real breaks, and program pictures (LESSON_EVERY apart: 20 min)
+LEAST_TRAIN_BREAKS, LEAST_TRAIN_PROGRAM = 3, 450  # to learn from (30 min of program)
+LESSON_AGAIN = 20 * 3600    # learned again after this long, once the TVs are quiet
+LESSON_QUIET = 1800         # quiet: no TV has asked for this long
+LOOK_HEAD = b'HPAL1'
+lessons = {'state': 'not learned yet', 'at': None, 'model': None, 'channels': {}}
+lesson_state = {'use': {}}  # the lessons the answers use: channel -> (middle, direction, line, from, held)
+lesson_lock = threading.Lock()   # learning one at a time
+lesson_write = threading.Lock()  # the files being added to
+
+
+def lesson_key(ch):
+    """A channel's key: its name's letters and digits, in capitals (as the recordings' names have it)."""
+    return re.sub(r'[^A-Z0-9]', '', str(ch or '').upper())[:64]
+
+
+def lesson_day(t):
+    """The day a picture's time is in (ms since 1970), as 'YYYYMMDD'."""
+    return time.strftime('%Y%m%d', time.gmtime(t / 1000 - LESSON_DAY_SHIFT * 3600))
+
+
+def looks_dir(key=None):
+    d = os.path.join(LESSONS, 'looks', re.sub(r'[^a-z0-9.-]', '', MODEL_ID.lower()))
+    return d if key is None else os.path.join(d, key)
+
+
+def events_dir(key=None):
+    d = os.path.join(LESSONS, 'events')
+    return d if key is None else os.path.join(d, key)
+
+
+class LookLog:
+    """What the AI saw of each channel's pictures (by the picture's own time): a file a day for each channel, each
+    picture 12 bytes and a byte a number. Only the AI's numbers: never a picture."""
+
+    def __init__(self):
+        self.files = {}
+
+    def add(self, key, t, e):
+        scale = float(np.abs(e).max()) / 127.0 or 1e-9
+        q = np.clip(np.round(e / scale), -127, 127).astype(np.int8)
+        rec = struct.pack('>qf', int(t), scale) + q.tobytes()
+        day = lesson_day(t)
+        with lesson_write:
+            f = self.files.get((key, day))
+            if f is None:
+                while len(self.files) >= 4:  # (two TVs, each about to start a new day)
+                    self.files.pop(next(iter(self.files))).close()
+                d = looks_dir(key)
+                os.makedirs(d, exist_ok=True)
+                p = os.path.join(d, day + '.bin')
+                new = not os.path.isfile(p) or os.path.getsize(p) < len(LOOK_HEAD) + 2
+                f = open(p, 'ab')
+                if new:
+                    f.seek(0)
+                    f.truncate()
+                    f.write(LOOK_HEAD + struct.pack('>h', len(e)))
+                self.files[(key, day)] = f
+            f.write(rec)
+            f.flush()
+
+    def close(self):
+        with lesson_write:
+            for f in self.files.values():
+                f.close()
+            self.files.clear()
+
+    @staticmethod
+    def days(key):
+        d = looks_dir(key)
+        return sorted(n[:8] for n in os.listdir(d) if n.endswith('.bin') and len(n) == 12) if os.path.isdir(d) else []
+
+    @staticmethod
+    def read(key, day):
+        """A day's pictures of a channel: their times (ms) and what the AI saw (length 1), in time order."""
+        p = os.path.join(looks_dir(key), day + '.bin')
+        try:
+            with open(p, 'rb') as f:
+                data = f.read()
+        except OSError:
+            return np.zeros(0, np.int64), np.zeros((0, 0), np.float32)
+        if data[:len(LOOK_HEAD)] != LOOK_HEAD:
+            return np.zeros(0, np.int64), np.zeros((0, 0), np.float32)
+        dim = struct.unpack('>h', data[len(LOOK_HEAD):len(LOOK_HEAD) + 2])[0]
+        body = data[len(LOOK_HEAD) + 2:]
+        rl = 12 + dim
+        n = len(body) // rl
+        a = np.frombuffer(body[:n * rl], np.uint8).reshape(n, rl)
+        t = a[:, :8].copy().view('>i8').reshape(n).astype(np.int64)
+        scale = a[:, 8:12].copy().view('>f4').reshape(n).astype(np.float32)
+        e = a[:, 12:].copy().view(np.int8).astype(np.float32) * scale[:, None]
+        e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-9)
+        order = np.argsort(t, kind='stable')
+        return t[order], e[order]
+
+
+looklog = LookLog()
+
+
+def lesson_event(body, replay=False):
+    """(1.9.0) A TV's word on its channel: a run of the AI's ads that ended (real or not), a screen that came down, the
+    show on now. A replay's are left out (its pictures are the recordings', already counted)."""
+    j = json.loads(body)
+    key = lesson_key(j.get('channel'))
+    kind = j.get('kind')
+    if not key or kind not in ('run', 'screen', 'show'):
+        raise ValueError('not an event')
+    ev = {'kind': kind}
+    if kind == 'show':
+        ev['at'] = int(j['at'])
+        ev['name'] = str(j.get('name') or '')[:120]
+        when = ev['at']
+    else:
+        ev['from'], ev['to'] = int(j['from']), int(j['to'])
+        if not 0 <= ev['to'] - ev['from'] <= 3 * 3600 * 1000:
+            raise ValueError('not a span')
+        if kind == 'run':
+            ev['real'] = bool(j.get('real'))
+            ev['why'] = str(j.get('why') or '')[:120]
+        when = ev['from']
+    if replay:
+        return {'kept': False, 'note': "a replay's: not kept"}
+    d = events_dir(key)
+    with lesson_write:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, lesson_day(when) + '.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(ev) + '\n')
+    return {'kept': True}
+
+
+def lesson_events(key, days):
+    """A channel's events on these days: its runs [(from, to, real)], screens [(from, to)], shows [(at, name)]."""
+    runs, screens, shows = [], [], []
+    for day in days:
+        try:
+            with open(os.path.join(events_dir(key), day + '.jsonl'), encoding='utf-8') as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            if ev.get('kind') == 'run':
+                runs.append((int(ev['from']), int(ev['to']), bool(ev.get('real'))))
+            elif ev.get('kind') == 'screen':
+                screens.append((int(ev['from']), int(ev['to'])))
+            elif ev.get('kind') == 'show':
+                shows.append((int(ev['at']), str(ev.get('name') or '')))
+    return sorted(runs), sorted(screens), sorted(shows)
+
+
+def in_spans(t, spans):
+    """For each time, whether it's inside any of the spans [(from, to)]."""
+    out = np.zeros(len(t), bool)
+    for a, b in spans:
+        out |= (t >= a) & (t <= b)
+    return out
+
+
+def lesson_labels(t, runs, screens):
+    """Each picture's answer: 1 an ad (inside a real break, its edges left out), 0 the program (well away from any run
+    and any screen), -1 neither."""
+    ad = in_spans(t, [(a + LESSON_TRIM, b - LESSON_TRIM) for a, b, real in runs if real and b - a > 2 * LESSON_TRIM])
+    near = in_spans(t, [(a - LESSON_AWAY, b + LESSON_AWAY) for a, b, _ in runs] + [(a - LESSON_AWAY, b + LESSON_AWAY) for a, b in screens])
+    lab = np.full(len(t), -1, np.int8)
+    lab[~near] = 0
+    lab[ad] = 1
+    return lab
+
+
+def lesson_sample(t, lab):
+    """One picture of each answer each LESSON_EVERY ms: their places."""
+    keep, seen = [], set()
+    for i in np.flatnonzero(lab >= 0):
+        k = (int(lab[i]), int(t[i]) // LESSON_EVERY)
+        if k not in seen:
+            seen.add(k)
+            keep.append(i)
+    return np.array(keep, np.int64)
+
+
+def lesson_screen(t, words):
+    """The screen a lesson would put up on a day's pictures (in time order): its runs [(from, to)] of ad words (3 in a
+    row start one, 2 of the program end it; a gap in the watching ends it too)."""
+    out, row_ad, row_prog, start, last = [], 0, 0, None, None
+    on = False
+    prev = None
+    t = [int(x) for x in t]
+    for k in range(len(t)):
+        if prev is not None and t[k] - prev > LESSON_GAP:
+            if on:
+                out.append((start, last))
+            on, row_ad, row_prog = False, 0, 0
+        prev = t[k]
+        if words[k]:
+            row_ad += 1
+            row_prog = 0
+            if not on and row_ad == 1:
+                first = t[k]
+            if not on and row_ad >= LESSON_RUN_START:
+                on, start = True, first
+            last = t[k] if on else last
+        else:
+            row_prog += 1
+            row_ad = 0
+            if on and row_prog >= LESSON_RUN_END:
+                out.append((start, last))
+                on = False
+    if on:
+        out.append((start, last))
+    return out
+
+
+def overlap(a, b, spans):
+    return sum(max(0, min(b, y) - max(a, x)) for x, y in spans)
+
+
+def watch_ms(t):
+    """How long the pictures were being watched (their gaps up to LESSON_GAP)."""
+    if len(t) < 2:
+        return 0
+    g = np.diff(t)
+    return int(g[g <= LESSON_GAP].sum())
+
+
+def lesson_test(t, e, runs, shows, mid, d, line):
+    """A lesson on a day it didn't learn from: its screen's cover of the real breaks, and its time up outside them
+    (s an hour), for the day and for each show."""
+    s = (e - mid) @ d
+    screen = lesson_screen(t, s > line)
+    real = [(a, b) for a, b, r in runs if r]
+    near = [(a - LESSON_NEAR, b + LESSON_NEAR) for a, b in real]
+    covered, real_ms = int(sum(overlap(a, b, screen) for a, b in real)), int(sum(b - a for a, b in real))
+    cover = covered / max(1, real_ms)
+    # Each screen's time outside the real breaks, by the show it was on.
+    names = [n for _, n in shows]
+    starts = np.array([a for a, _ in shows], np.int64)
+
+    def show_at(x):
+        k = int(np.searchsorted(starts, x, side='right')) - 1 if len(starts) else -1
+        return names[k] if k >= 0 else ''
+    false_by, watch_by = {}, {}
+    for a, b in screen:
+        out = (b - a) - overlap(a, b, near)
+        if out > 0:
+            false_by[show_at(a)] = false_by.get(show_at(a), 0) + out
+    if len(t) > 1:
+        g = np.diff(t)
+        for k in np.flatnonzero(g <= LESSON_GAP):
+            n = show_at(int(t[k]))
+            watch_by[n] = watch_by.get(n, 0) + int(g[k])
+    # A show it can't keep the screen off is held (the TV's rules there); the rest is what's tested.
+    held = sorted(n for n in watch_by if n and watch_by[n] >= HOLD_LEAST * 60_000
+                  and false_by.get(n, 0) * 3600 / watch_by[n] > HOLD_FALSE)
+    watched = max(1, sum(v for n, v in watch_by.items() if n not in held))
+    false_s = float(sum(v for n, v in false_by.items() if n not in held)) / 1000
+    per_h = false_s * 3600_000 / watched
+    return {'cover': round(cover, 3), 'false_s': round(false_s, 1), 'false_per_hour': round(per_h, 1),
+            'watched_min': round(watched / 60000), 'screens': len(screen), 'held': held, 'covered_ms': covered,
+            'real_ms': real_ms, 'watched_ms': int(watched), 'held_ms': int(sum(v for n, v in watch_by.items() if n in held)),
+            'held_false_s': round(float(sum(v for n, v in false_by.items() if n in held)) / 1000, 1)}
+
+
+def lesson_check(X, y, mid, d, line):
+    """How well a lesson parts answered pictures: its AUC and the share of ads over its line."""
+    s = (X - mid) @ d
+    a = auc(s[y == 1], s[y == 0])
+    return (None if a is None else round(a, 4)), (round(float(np.mean(s[y == 1] > line)), 4) if (y == 1).any() else None)
+
+
+def lesson_passes(r):
+    return bool((r.get('auc') or 0) >= PASS_AUC and (r.get('caught') or 0) >= PASS_CAUGHT and
+                (r.get('cover') or 0) >= PASS_COVER and r.get('false_per_hour', 1e9) <= PASS_FALSE)
+
+
+def lesson_fit(X, y):
+    mid, d = probe_fit(X, y)
+    s = (X - mid) @ d
+    line = float(np.quantile(s[y == 0], 1 - LESSON_FP))
+    return mid.astype(np.float32), d.astype(np.float32), line
+
+
+def lesson_channel(key, before=None):
+    """A channel's data: each day's answered pictures (one each LESSON_EVERY ms of an answer), and its events."""
+    days = LookLog.days(key)
+    if before is not None:
+        days = [x for x in days if x <= lesson_day(before)]
+    runs, screens, shows = lesson_events(key, days)
+    if before is not None:
+        runs = [r for r in runs if r[1] < before]
+        screens = [s for s in screens if s[1] < before]
+    per_day = []
+    for day in days:
+        t, e = LookLog.read(key, day)
+        if before is not None:
+            keep = t < before
+            t, e = t[keep], e[keep]
+        if not len(t):
+            continue
+        lab = lesson_labels(t, runs, screens)
+        pick = lesson_sample(t, lab)
+        breaks = sum(1 for a, b, r in runs if r and lesson_day(a) == day)
+        per_day.append({'day': day, 'X': e[pick], 'y': lab[pick].astype(np.int64), 't': t[pick], 'breaks': breaks,
+                        'program': int((lab[pick] == 0).sum())})
+    return per_day, runs, screens, shows
+
+
+def lesson_split(test, real, tb, tp):
+    """Where to split a day (its later part the test), so the later part has LEAST_BREAKS real breaks and
+    LEAST_PROGRAM program pictures and the earlier one, with the other days, enough to learn from; or None."""
+    ts = np.asarray(test['t'])
+    if not len(ts):
+        return None
+    for q in (0.6, 0.5, 0.7, 0.4, 0.75):
+        s = int(np.quantile(ts, q))
+        late_b = sum(1 for a, b, _ in real if a >= s)
+        early_b = sum(1 for a, b, _ in real if b < s)
+        late_p = int(((ts >= s) & (np.asarray(test['y']) == 0)).sum())
+        early_p = int(((ts < s) & (np.asarray(test['y']) == 0)).sum())
+        if late_b >= LEAST_BREAKS and late_p >= LEAST_PROGRAM and tb + early_b >= LEAST_TRAIN_BREAKS and tp + early_p >= LEAST_TRAIN_PROGRAM:
+            return s
+    return None
+
+
+def lesson_learn_one(key, before=None):
+    """A channel's own lesson: learned from all but its newest day with enough answers, tested on that day; if it
+    passes, learned again from all of them."""
+    per_day, runs, screens, shows = lesson_channel(key, before)
+    out = {'channel': key, 'days': len(per_day), 'breaks': sum(p['breaks'] for p in per_day),
+           'program_min': round(sum(p['program'] for p in per_day) * LESSON_EVERY / 60000), 'passed': False}
+    test = next((p for p in reversed(per_day) if p['breaks'] >= LEAST_BREAKS and p['program'] >= LEAST_PROGRAM), None)
+    if test is None:
+        out['note'] = 'learning: not a day with %d real breaks and %d min of program yet' % (LEAST_BREAKS, LEAST_PROGRAM * LESSON_EVERY // 60000)
+        return out, None
+    train = [p for p in per_day if p is not test]
+    tb, tp = sum(p['breaks'] for p in train), sum(p['program'] for p in train)
+    split = None
+    if tb < LEAST_TRAIN_BREAKS or tp < LEAST_TRAIN_PROGRAM:
+        # Not enough besides its newest day: that day split, its later part the test (a channel's first long day).
+        split = lesson_split(test, [x for x in runs if x[2] and lesson_day(x[0]) == test['day']], tb, tp)
+        if split is None:
+            out['note'] = 'learning: %d real breaks and %d min of program besides its newest day (needs %d and %d)' % (
+                tb, tp * LESSON_EVERY // 60000, LEAST_TRAIN_BREAKS, LEAST_TRAIN_PROGRAM * LESSON_EVERY // 60000)
+            return out, None
+    early = [] if split is None else [i for i in range(len(test['t'])) if test['t'][i] < split]
+    late = slice(None) if split is None else np.array([i for i in range(len(test['t'])) if test['t'][i] >= split], np.int64)
+    X = np.concatenate([p['X'] for p in train] + ([test['X'][early]] if early else []))
+    y = np.concatenate([p['y'] for p in train] + ([test['y'][early]] if early else []))
+    mid, d, line = lesson_fit(X, y)
+    r = {'test_day': test['day']}
+    if split is not None:
+        r['test_from'] = split
+    r['auc'], r['caught'] = lesson_check(test['X'][late], test['y'][late], mid, d, line)
+    t, e = LookLog.read(key, test['day'])
+    keep = (t < before if before is not None else np.ones(len(t), bool)) & (t >= (split or 0))
+    t, e = t[keep], e[keep]
+    r.update(lesson_test(t, e, [x for x in runs if lesson_day(x[0]) == test['day'] and x[0] >= (split or 0)], shows, mid, d, line))
+    out['test'] = r
+    out['passed'] = lesson_passes(r)
+    out['held'] = r['held']
+    if not out['passed']:
+        out['note'] = 'not used: its test on %s fell short' % test['day']
+        return out, None
+    X = np.concatenate([p['X'] for p in per_day])
+    y = np.concatenate([p['y'] for p in per_day])
+    mid, d, line = lesson_fit(X, y)
+    out['note'] = 'used: its own'
+    return out, (mid, d, line)
+
+
+def lesson_borrow(key, own, before=None):
+    """A channel without its own lesson borrows another's that passes this channel's own test (all its answered
+    days, its newest three's screens): the best of them."""
+    per_day, runs, screens, shows = lesson_channel(key, before)
+    if sum(p['breaks'] for p in per_day) < LEAST_BREAKS or sum(p['program'] for p in per_day) < LEAST_PROGRAM:
+        return None
+    X = np.concatenate([p['X'] for p in per_day])
+    y = np.concatenate([p['y'] for p in per_day])
+    best = None
+    for other, (mid, d, line) in own.items():
+        if other == key:
+            continue
+        r = {}
+        r['auc'], r['caught'] = lesson_check(X, y, mid, d, line)
+        tests = []
+        for p in per_day[-3:]:
+            t, e = LookLog.read(key, p['day'])
+            if before is not None:
+                keep = t < before
+                t, e = t[keep], e[keep]
+            tests.append(lesson_test(t, e, [x for x in runs if lesson_day(x[0]) == p['day']], shows, mid, d, line))
+        r['cover'] = round(sum(x['covered_ms'] for x in tests) / max(1, sum(x['real_ms'] for x in tests)), 3)
+        r['false_per_hour'] = round(sum(x['false_s'] for x in tests) * 3600_000 / max(1, sum(x['watched_ms'] for x in tests)), 1)
+        r['held'] = sorted({h for x in tests for h in x['held']})
+        r['watched_ms'] = sum(x['watched_ms'] for x in tests)
+        r['held_ms'] = sum(x['held_ms'] for x in tests)
+        # A borrowed lesson must fit this channel: it may hold (leave to the TV's rules) at most a quarter of its
+        # watching; the best is the one that holds least, then puts the screen up least outside real breaks.
+        if not lesson_passes(r) or r['held_ms'] > 0.25 * max(1, r['watched_ms'] + r['held_ms']):
+            continue
+        rank = (r['held_ms'], r['false_per_hour'], -(r['caught'] or 0), -(r['auc'] or 0), other)
+        if best is None or rank < best[2]:
+            best = (other, r, rank)
+    return None if best is None else best[:2]
+
+
+def lesson_force(key, before=None):
+    """(A test's) A channel's lesson learned from all its answered pictures (before a time), used without a test of
+    its own: for replaying what came after, with what came before."""
+    per_day, runs, screens, shows = lesson_channel(key, before)
+    if not per_day or sum(p['breaks'] for p in per_day) < 1:
+        return None
+    X = np.concatenate([p['X'] for p in per_day])
+    y = np.concatenate([p['y'] for p in per_day])
+    if not (y == 1).any() or not (y == 0).any():
+        return None
+    return lesson_fit(X, y)
+
+
+def learn_lessons(before=None, only=None, force=False):
+    """(1.9.0) Every channel's lesson learned again (one learning at a time); the answers use the new ones at once."""
+    if not lesson_lock.acquire(blocking=False):
+        return False
+    try:
+        lessons['state'] = 'learning'
+        say('the lessons: learning')
+        lesson_prune()
+        keys = sorted(os.listdir(looks_dir())) if os.path.isdir(looks_dir()) else []
+        if only:
+            keys = [k for k in keys if k in only]
+        chans, own, use = {}, {}, {}
+        for key in keys:
+            try:
+                out, got = lesson_learn_one(key, before)
+            except Exception as e:
+                out, got = {'channel': key, 'passed': False, 'note': "couldn't learn (%s)" % type(e).__name__}, None
+            if got is None and force:  # (a test's: POST /lessons/learn?force=1) used without passing a test of its own
+                got = lesson_force(key, before)
+                if got is not None:
+                    out['note'] = 'used: its own, forced (a test: learned from all of it, not tested)'
+                    out['forced'] = True
+            chans[key] = out
+            if got is not None:
+                own[key] = got
+                use[key] = got + ('own', out.get('held') or [])
+        for key in keys:
+            if key in own:
+                continue
+            try:
+                b = lesson_borrow(key, own, before)
+            except Exception as e:
+                b = None
+                chans[key]['note'] = chans[key].get('note', '') + " (borrowing couldn't be tried: %s)" % type(e).__name__
+            if b is not None:
+                other, r = b
+                chans[key].update({'borrowed': other, 'borrow_test': r, 'held': r['held'],
+                                   'note': "used: %s's, which passed this channel's own test" % other})
+                use[key] = own[other] + (other, r['held'])
+        lessons.update({'state': 'learned', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'model': MODEL_ID, 'channels': chans,
+                        'before': before})
+        lesson_state['use'] = use
+        lesson_save(use)
+        say('the lessons: learned (%d channels, %d used: %s)' % (len(chans), len(use), ', '.join(
+            '%s%s' % (k, '' if v[3] == 'own' else ' (by %s)' % v[3]) for k, v in sorted(use.items())) or 'none yet'))
+        return True
+    finally:
+        lesson_lock.release()
+
+
+def lesson_save(use):
+    """The lessons in use, kept (back on a restart; another main model's aren't)."""
+    data = {'model': MODEL_ID, 'summary': lessons, 'use': {k: {
+        'mid': base64.b64encode(v[0].astype('<f4').tobytes()).decode('ascii'),
+        'dir': base64.b64encode(v[1].astype('<f4').tobytes()).decode('ascii'),
+        'line': v[2], 'from': v[3], 'held': v[4]} for k, v in use.items()}}
+    os.makedirs(LESSONS, exist_ok=True)
+    tmp = os.path.join(LESSONS, 'lessons.json.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+    os.replace(tmp, os.path.join(LESSONS, 'lessons.json'))
+
+
+def lesson_load():
+    try:
+        with open(os.path.join(LESSONS, 'lessons.json'), encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if data.get('model') != MODEL_ID:
+        return
+    lessons.update(data.get('summary') or {})
+    lesson_state['use'] = {k: (np.frombuffer(base64.b64decode(v['mid']), '<f4').copy(), np.frombuffer(base64.b64decode(v['dir']), '<f4').copy(),
+                               float(v['line']), v['from'], list(v.get('held') or [])) for k, v in (data.get('use') or {}).items()}
+
+
+def lesson_prune():
+    """The AI's numbers and the events kept LESSON_DAYS days (another main model's too), then deleted."""
+    oldest = lesson_day(time.time() * 1000 - LESSON_DAYS * 86400_000)
+    for root in (os.path.join(LESSONS, 'looks'), events_dir()):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            for n in filenames:
+                if n[:8].isdigit() and n[:8] < oldest:
+                    os.remove(os.path.join(dirpath, n))
+            if dirpath != root and not os.listdir(dirpath):
+                os.rmdir(dirpath)
+
+
+def lesson_answer(key, e):
+    """A channel's lesson on this picture, for its answer (or None while it has none in use)."""
+    u = lesson_state['use'].get(key)
+    if u is None or len(u[0]) != len(e):
+        return None
+    mid, d, line, frm, held = u
+    return {'score': round(float((e - mid) @ d), 4), 'line': round(line, 4), 'from': frm, 'held': held}
+
+
+def lessons_view():
+    v = json.loads(json.dumps(lessons))
+    v['used'] = sorted(lesson_state['use'])
+    # What's kept for the lessons: each channel's days of the AI's numbers, its pictures today, its words today.
+    today = lesson_day(time.time() * 1000)
+    kept = {}
+    try:
+        for key in sorted(os.listdir(looks_dir())) if os.path.isdir(looks_dir()) else []:
+            days = LookLog.days(key)
+            p = os.path.join(looks_dir(key), today + '.bin')
+            n = 0
+            if os.path.isfile(p):
+                with open(p, 'rb') as f:
+                    head = f.read(len(LOOK_HEAD) + 2)
+                if head[:len(LOOK_HEAD)] == LOOK_HEAD:
+                    n = (os.path.getsize(p) - len(head)) // (12 + struct.unpack('>h', head[len(LOOK_HEAD):])[0])
+            kept[key] = {'days': len(days), 'pictures_today': n}
+        for key in sorted(os.listdir(events_dir())) if os.path.isdir(events_dir()) else []:
+            p = os.path.join(events_dir(key), today + '.jsonl')
+            counts = {}
+            if os.path.isfile(p):
+                with open(p, encoding='utf-8') as f:
+                    for ln in f:
+                        k = (json.loads(ln) or {}).get('kind', '?')
+                        counts[k] = counts.get(k, 0) + 1
+            kept.setdefault(key, {'days': 0, 'pictures_today': 0})['words_today'] = counts
+    except (OSError, ValueError):
+        pass
+    v['kept'] = kept
+    v['today'] = today
+    return v
+
+
+def lessons_loop():
+    """Learns again each night: LESSON_AGAIN after the last, once no TV has asked for LESSON_QUIET."""
+    while True:
+        time.sleep(600)
+        try:
+            last = os.path.getmtime(os.path.join(LESSONS, 'lessons.json')) if os.path.isfile(os.path.join(LESSONS, 'lessons.json')) else 0
+            if time.time() - last >= LESSON_AGAIN and time.time() - state['last_look'] >= LESSON_QUIET and state['ready']:
+                learn_lessons()
+        except Exception as e:
+            lessons['state'] = "couldn't learn (%s)" % type(e).__name__
+            say('the lessons: ' + lessons['state'])
+
+
 def home_network(addr):
     try:
         ip = ipaddress.ip_address(addr)
@@ -1955,9 +2569,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     'spot_ms': round(state['spot_ms']), 'read_model': READ_ID, 'read_ready': state['read_ready'],
                                     'read_note': state['read_note'], 'reads': state['reads'], 'read_ms': round(state['read_ms']),
                                     'read_side_max': READ_SIDE_MAX, 'ads': ads.n, 'ads_note': ads.note,
-                                    'bench': bench['state'] + (' (%s)' % bench['note'] if bench['note'] else '')})
+                                    'bench': bench['state'] + (' (%s)' % bench['note'] if bench['note'] else ''),
+                                    'lessons': '%s (%d in use)' % (lessons['state'], len(lesson_state['use']))})
         if self.path.split('?')[0] == '/bench':
             return self.reply(200, bench_view())
+        if self.path.split('?')[0] == '/lessons':  # (1.9.0) each channel's lesson: learned, tested, used or not, why
+            return self.reply(200, lessons_view())
         self.reply(404, {'note': 'GET /status, GET /bench, POST /look, POST /read, POST /ads, POST /ads/forget or POST /bench'})
 
     def do_POST(self):
@@ -2027,12 +2644,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if 'signs=1' in query.split('&'):  # (1.6.0) what its lines say of an ad
                 answer['signs'] = ad_signs(answer['lines'])
             return self.reply(200, answer)
+        if path == '/lessons/event':  # (1.9.0) a TV's word on its channel: a run of the AI's ads, a screen, the show
+            n = int(self.headers.get('Content-Length') or 0)
+            if n <= 0 or n > 10_000:
+                return self.reply(400, {'note': 'an event, as JSON'})
+            try:
+                return self.reply(200, lesson_event(self.rfile.read(n), 'replay=1' in query.split('&')))
+            except Exception as e:
+                return self.reply(400, {'note': 'not an event it could use (%s)' % type(e).__name__})
+        if path == '/lessons/learn':  # (1.9.0) learned now (a test can give a time to learn from what came before)
+            if not state['ready']:
+                return self.reply(503, {'note': 'not until the main model is ready'})
+            before, only, force = None, None, False
+            for kv in query.split('&'):
+                if kv.startswith('before=') and kv[7:].isdigit():
+                    before = int(kv[7:])
+                elif kv.startswith('channels='):
+                    only = {lesson_key(c) for c in urllib.parse.unquote(kv[9:]).split(',') if lesson_key(c)}
+                elif kv == 'force=1':  # a test's: a channel's lesson used without passing a test of its own
+                    force = True
+            if lesson_lock.locked():
+                return self.reply(409, {'note': 'already learning'})
+            threading.Thread(target=learn_lessons, args=(before, only, force), daemon=True).start()
+            return self.reply(202, {'note': 'learning: GET /lessons says when it is done'})
         if path != '/look':
-            return self.reply(404, {'note': 'POST /look, POST /read or POST /ads'})
-        box = None
+            return self.reply(404, {'note': 'POST /look, POST /read, POST /ads or POST /lessons/event'})
+        box, ch, t, replay = None, None, None, False
         for kv in query.split('&'):
             if kv.startswith('spot='):
                 box = spot_box(kv[5:])
+            elif kv.startswith('ch='):  # (1.9.0) the channel and the picture's own time (ms), for its lesson
+                ch = urllib.parse.unquote(kv[3:])
+            elif kv.startswith('t=') and kv[2:].isdigit():
+                t = int(kv[2:])
+            elif kv == 'replay=1':
+                replay = True
         n = int(self.headers.get('Content-Length') or 0)
         if n <= 0 or n > 4_000_000:
             return self.reply(400, {'note': 'a JPEG, up to 4 MB'})
@@ -2040,7 +2686,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not state['ready']:
             return self.reply(503, {'note': state['note']})
         try:
-            return self.reply(200, look(body, box))
+            return self.reply(200, look(body, box, ch, t, replay))
         except Exception as e:
             return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
 
@@ -2094,6 +2740,8 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     say('Home picture AI %s, answering on port %d' % (VERSION, PORT))
     ads.load()
+    lesson_load()  # (1.9.0) the channels' lessons in use (this main model's)
+    threading.Thread(target=lessons_loop, daemon=True).start()
     threading.Thread(target=announce, daemon=True).start()
     wait = 30
     while True:  # never gives up: a problem is said in the log and tried again, later each time

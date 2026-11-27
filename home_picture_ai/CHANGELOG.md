@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.9.0
+
+- Each channel's own lesson. A TV can say which channel a picture is of and when (`POST /look?ch=NAME&t=MS`), and how
+  each run of the AI's ads on it ended, when its screen was up and which show was on (`POST /lessons/event`). What the
+  AI saw of each picture (its 512 numbers, never the picture) is kept by channel for 21 days. Each night, once the TVs
+  have been quiet for half an hour, each channel's lesson is learned again: ad pictures from its real breaks (a silence
+  or black where they began, ads seen before, an ad's words), program pictures well away from any run of the AI's ads
+  or any screen. Before a lesson is used it's tested on the newest day it didn't learn from (or, on a channel's first
+  long day, its later part): it must part that day's breaks from its program, its screen must cover the real breaks,
+  and it must keep the screen off the program (a show it can't is held, and goes by the TV's rules). A channel without
+  its own lesson can use another channel's that passes this channel's own test. A lesson in use comes with every
+  answer for its channel (`lesson`: its score, its line, where it's from, its held shows). `GET /lessons` says how each
+  channel's went; `POST /lessons/learn` learns now. A replay's pictures and words (`replay=1`) aren't kept.
+
 ## 1.8.0
 
 - Scoring the models on his recordings: `POST /bench?set=score`, with the answers as JSON (for each set: its channel,
