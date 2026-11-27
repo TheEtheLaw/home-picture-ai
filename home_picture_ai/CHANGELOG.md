@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.0
+
+- Scoring the models on his recordings: `POST /bench?set=score`, with the answers as JSON (for each set: its channel,
+  its minutes, the spans of its ads and of its programs). Each model the TVs could run (CLIP ViT-B/32 and MobileCLIP2-S0,
+  the ones the TVs use now, and MobileCLIP2-S2 and -B) looks at the recorded pictures in those spans, and it says how
+  well the model's lean parts the ads from the programs (by its own text half and the same words for every model: 14
+  kinds of ad, 15 of program), how many ads it catches with 2% of the program's pictures called ads, how well its
+  likeness to the program's look does (as a TV learns it), both together, what a lean learned from the first half of
+  a channel's answers does on the second half, and how another channel's answered spans fare by the first channel's
+  line and learned lean. The TVs' model is also scored with the lean the TVs use now. Text halves and new models are
+  downloaded (fixed versions, checked) and deleted after; nothing but the numbers is kept.
+
 ## 1.7.2
 
 - Letting go of remembered ads is on again, for the pictures a TV sends with `"logo": "goes"`: their logo is one the TV

@@ -66,7 +66,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.7.2'
+VERSION = '1.8.0'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -1180,10 +1180,12 @@ def bench_run(which='one'):
     try:
         if which == 'read':
             bench_read()
+        elif isinstance(which, dict):
+            score_run(which)
         else:
             bench_models(which)
     except Exception as e:
-        bench['note'] = 'stopped (%s)' % type(e).__name__
+        bench['note'] = 'stopped (%s)' % (e if isinstance(e, (IOError, RuntimeError)) else type(e).__name__)
         say('the bench: ' + bench['note'])
     finally:
         if bench['state'] == 'running':
@@ -1574,6 +1576,356 @@ def bench_read():
         say('the bench (read): done, %d pictures read' % done)
 
 
+# ---- (1.8.0) Scoring: how well each model tells his channels' ads from their programs, on his recordings ----
+# Each model's own text half says what an ad is and what a program is (the same words for every model); its picture
+# half looks at pictures of his recordings whose answers come with the bench (a channel's afternoon game: the breaks the
+# TV's replays found real, its program well away from them; another channel's morning: the screens he answered). How
+# well each parts them: its lean (by those words), its likeness to the program's look (as a TV learns it), both, and
+# what it could learn (a lean set on one part of a channel's answers, tried on the rest and on another channel).
+# Numbers only: no picture is kept or sent anywhere, and the models downloaded for it are deleted after.
+VOCAB_URL = 'https://raw.githubusercontent.com/mlfoundations/open_clip/v2.24.0/src/open_clip/bpe_simple_vocab_16e6.txt.gz'
+VOCAB_SIZE, VOCAB_SHA = 1_356_917, '924691ac288e54409236115652ad4aa250f48203de50a9e4722a6ecd48d6804a'
+VOCAB = os.path.join(DATA, 'bpe_simple_vocab_16e6.txt.gz')
+XEN = HF + 'Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523/onnx/'
+# (id, what, picture half (None: on this Pi already), its size and SHA-256, side, mean and spread, text half, its size
+# and SHA-256): the ones the bench found fast enough for every picture of one TV (2 a second) on this Pi.
+SCORE_MODELS = [
+    (MODEL_ID, "CLIP ViT-B/32 (the AI's now)", None, 0, None, 224, 'clip',
+     XEN + 'text_model.onnx', 254_058_553, '3f6571f5bad13a97c469c1622e1cfc4d9aef78b79fdbfcff804ca357bfada8cc'),
+    (SPOT_ID, "MobileCLIP2-S0 (the logo's spot now)", None, 0, None, 256, 'unit',
+     MC2 + 's0/text_model.onnx', 254_053_669, 'df590d47744f2ee9f3ccb67c4414d17419568c05bca0c4d166f2faeedf8b92f3'),
+    ('mobileclip2-s2', 'MobileCLIP2-S2', MC2 + 's2/vision_model.onnx', 143_044_797,
+     'a841f72c5a5085748bbe271a1d5718aba877822a15cba865bdbd0d37036b849e', 256, 'unit',
+     MC2 + 's2/text_model.onnx', 254_053_669, '622f10372bca71b5017f2efc5f8c2886610a2592b636de8984d717f03213f031'),
+    ('mobileclip2-b', 'MobileCLIP2-B', MC2 + 'b/vision_model.onnx', 345_545_489,
+     '2f3873e400fd1adc5298b72d29e81bb69337e58601cf2853c43bc1211631eecd', 224, 'unit',
+     MC2 + 'b/text_model.onnx', 254_342_238, 'f5cbb08e1eb6a5da690554a43cd37304835c0412c547ddb4ae86f0f8759686e0'),
+]
+# What an ad is, and what a program is: the same words for every model.
+SCORE_ADS = [
+    'a TV commercial', 'a television advertisement', 'a commercial break on TV', 'a car commercial',
+    "an ad for a phone app with the app's logo", 'a product shown with its price', 'an ad with a promo code and a website',
+    "a brand's logo on a plain background at the end of a commercial", 'an insurance commercial',
+    'a fast food commercial', 'a medicine commercial with fine print', 'a movie trailer', 'a promo for a TV show',
+    'a sports betting app commercial']
+SCORE_PROGRAMS = [
+    'a live basketball game on TV', 'a live football game on TV', 'a sports broadcast with the score on screen',
+    'a sports studio show with hosts at a desk', 'a TV news broadcast with an anchor', 'a talk show',
+    'a scene from a TV drama', 'a scene from a movie', 'a documentary', 'an interview on TV', 'a morning show with hosts',
+    'a live game shown beside an ad', "a sponsor's graphic during a sports broadcast",
+    "a sports channel's logo and ticker over the game", 'a sitcom scene']
+SCORE_FP = 0.02     # the share of program pictures that may be called ads, for "ads caught" (the show protected first)
+SCORE_LEARN = 0.3   # the first part of a set's program pictures (in time) that makes its program's look; the rest tests it
+SCORE_MOST = 3000   # pictures at most in all (the rest left out evenly)
+SCORE_MEMORY = 3    # a model's file this many times over (and 300 MB) free in memory before it's loaded
+
+
+def bytes_to_unicode():
+    """CLIP's byte-to-letter table (OpenAI's, MIT): every byte a printable letter, for the word pieces."""
+    bs = list(range(ord('!'), ord('~') + 1)) + list(range(ord('\xa1'), ord('\xac') + 1)) + list(range(ord('\xae'), ord('\xff') + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, [chr(c) for c in cs]))
+
+
+class ClipTokens:
+    """CLIP's word pieces (OpenAI's tokenizer, MIT; MobileCLIP2's too), for plain English words: 77 numbers, the start,
+    the pieces, the end, then 0s."""
+    PAT = re.compile(r"""<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[a-z]+|[0-9]|[^\sa-z0-9]+""")
+
+    def __init__(self, vocab_gz):
+        import gzip
+        merges = gzip.open(vocab_gz).read().decode('utf-8').split('\n')
+        merges = [tuple(m.split()) for m in merges[1:49152 - 256 - 2 + 1]]
+        self.byte_encoder = bytes_to_unicode()
+        vocab = list(self.byte_encoder.values())
+        vocab = vocab + [v + '</w>' for v in vocab]
+        vocab += [''.join(m) for m in merges]
+        vocab += ['<|startoftext|>', '<|endoftext|>']
+        self.encoder = {v: i for i, v in enumerate(vocab)}
+        self.ranks = {m: i for i, m in enumerate(merges)}
+        self.sot, self.eot = self.encoder['<|startoftext|>'], self.encoder['<|endoftext|>']
+
+    def bpe(self, token):
+        word = tuple(token[:-1]) + (token[-1] + '</w>',)
+        while len(word) > 1:
+            pairs = {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+            best = min(pairs, key=lambda p: self.ranks.get(p, 1 << 30))
+            if best not in self.ranks:
+                break
+            out, i = [], 0
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i + 1]) == best:
+                    out.append(word[i] + word[i + 1])
+                    i += 2
+                else:
+                    out.append(word[i])
+                    i += 1
+            word = tuple(out)
+        return word
+
+    def ids(self, text, n=77):
+        text = re.sub(r'\s+', ' ', text).strip().lower()
+        v = [self.sot]
+        for tok in self.PAT.findall(text):
+            v += [self.encoder[t] for t in self.bpe(''.join(self.byte_encoder[b] for b in tok.encode('utf-8')))]
+        v = v[:n - 1] + [self.eot]
+        return v + [0] * (n - len(v))
+
+
+def roomy(path):
+    """Raises if too little memory is free to load this model."""
+    avail = meminfo('MemAvailable')
+    if avail is not None and avail < os.path.getsize(path) * SCORE_MEMORY + (300 << 20):
+        raise IOError('too little memory free (%d MB)' % (avail // 1_000_000))
+
+
+def score_words(path, toks):
+    """A model's lean, from its own text half: the ads' words' average less the programs', length 1."""
+    roomy(path)
+    s = bench_session(path, THREADS_ALL)
+    ids = np.array([toks.ids(t) for t in SCORE_ADS + SCORE_PROGRAMS], np.int64)
+    ins = s.get_inputs()
+    feeds = {}
+    for i in ins:
+        dt = np.int32 if 'int32' in i.type else np.int64
+        mask = 'mask' in i.name.lower() and len(ins) > 1
+        feeds[i.name] = ((ids != 0) if mask else ids).astype(dt)
+    outs = s.get_outputs()
+    name = next((o.name for o in outs if o.name == 'text_embeds'), None) or \
+        next((o.name for o in outs if len(o.shape) == 2), outs[0].name)
+    # One description at a time (a text half may take only one).
+    out = np.concatenate([s.run([name], {k: v[i:i + 1] for k, v in feeds.items()})[0] for i in range(len(ids))]).astype(np.float64)
+    del s
+    out /= np.linalg.norm(out, axis=1, keepdims=True)
+    d = out[:len(SCORE_ADS)].mean(0) - out[len(SCORE_ADS):].mean(0)
+    return (d / np.linalg.norm(d)).astype(np.float32)
+
+
+def auc(pos, neg):
+    """How often an ad's picture scores over a program's (0.5 a coin's toss, 1 every time); ties count half."""
+    pos, neg = np.asarray(pos, np.float64), np.asarray(neg, np.float64)
+    if len(pos) == 0 or len(neg) == 0:
+        return None
+    a = np.concatenate([pos, neg])
+    _, inv, counts = np.unique(a, return_inverse=True, return_counts=True)
+    first = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    ranks = (first + (counts + 1) / 2.0)[inv]  # each value's average rank (1 the lowest)
+    return float((ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
+
+
+def caught(pos, neg, fp=SCORE_FP):
+    """The share of ads over the line that lets at most fp of the programs over it, and the line."""
+    if len(pos) == 0 or len(neg) == 0:
+        return None, None
+    line = float(np.quantile(np.asarray(neg, np.float64), 1 - fp))
+    return float(np.mean(np.asarray(pos) > line)), line
+
+
+def probe_fit(x, y):
+    """What a lean learned from answers could be: a straight line through the pictures (ridge regression, ads and
+    programs weighed alike), its middle and its direction."""
+    x = x.astype(np.float64)
+    w = np.where(y == 1, 0.5 / max(1, int((y == 1).sum())), 0.5 / max(1, int((y == 0).sum()))) * len(y)
+    mid = (w[:, None] * x).sum(0) / w.sum()
+    xc = x - mid
+    a = (xc * w[:, None]).T @ xc
+    a += np.eye(x.shape[1]) * (0.1 * np.trace(a) / x.shape[1] + 1e-9)
+    return mid, np.linalg.solve(a, (xc * w[:, None]).T @ np.where(y == 1, 1.0, -1.0))
+
+
+def score_pictures(sets, r):
+    """Every set's pictures with their answers, from Home media: [(set, 1 an ad or 0 the program, time, JPEG, span)],
+    one each `every` ms at most for each answer; SCORE_MOST in all at most, the rest left out evenly."""
+    names = rec_names()
+    out = []
+    for si, st in enumerate(sets):
+        key = re.sub(r'[^A-Z0-9]', '', str(st.get('channel', '')).upper())
+        lo, hi = str(st.get('from', '')), str(st.get('to', '~'))
+        files = [n for n in names if len(n) > 20 and n.endswith('.rec') and key and n[:len(lo)] >= lo and n[:len(hi)] <= hi
+                 and key in re.sub(r'[^A-Z0-9]', '', n[16:-4].upper())]
+        every = max(1, int(st.get('every', 4000)))
+        spans = [(1, int(a), int(b)) for a, b in st.get('ads', [])] + [(0, int(a), int(b)) for a, b in st.get('programs', [])]
+        used = set()  # one picture each `every` ms of each span (a minute sent twice: once)
+        for i, n in enumerate(files):
+            r['now'] = 'reading %s (%d of %d minutes)' % (st.get('name') or key, i + 1, len(files))
+            try:
+                data = rec_get(n)
+            except Exception:
+                continue
+            for _, t, (a, ln) in rec_records(data, 'F'):
+                k = next((k for k, (_, x, y) in enumerate(spans) if x <= t <= y), None)
+                if k is None or (k, t // every) in used:
+                    continue
+                j = bytes(data[a:a + ln])
+                if j[:2] != b'\xff\xd8':
+                    continue
+                used.add((k, t // every))
+                out.append((si, spans[k][0], t, j, k))
+            del data
+        st['_files'] = len(files)
+    if len(out) > SCORE_MOST:
+        out = pick_even(out, SCORE_MOST)
+    return out
+
+
+def score_set(st, emb, score, lab, ts, span, ref):
+    """One set's numbers for one model (ref: the set its line and learned lean are taken from, with them)."""
+    res = {'name': st.get('name', ''), 'auc': auc(score[lab == 1], score[lab == 0])}
+    res['caught'], res['line'] = caught(score[lab == 1], score[lab == 0])
+    prog = np.flatnonzero(lab == 0)
+    if st.get('look') and len(prog) >= 20 and (lab == 1).any():
+        # Its likeness to the program's look, as a TV learns it: made from the first part of the program, tried after.
+        cut = np.sort(ts[prog])[int(len(prog) * SCORE_LEARN)]
+        lookv = emb[prog[ts[prog] < cut]].mean(0)
+        lookv /= np.linalg.norm(lookv)
+        test = ts >= cut
+        like, tl, tsc = emb[test] @ lookv, lab[test], score[test]
+        res['look_auc'] = auc(-like[tl == 1], -like[tl == 0])
+        res['look_caught'], _ = caught(-like[tl == 1], -like[tl == 0])
+        z = (tsc - tsc.mean()) / (tsc.std() + 1e-9) - (like - like.mean()) / (like.std() + 1e-9)
+        res['both_auc'] = auc(z[tl == 1], z[tl == 0])
+        res['both_caught'], _ = caught(z[tl == 1], z[tl == 0])
+    if st.get('probe'):
+        # What it could learn: a lean set on the first half of the set's answers (in time), tried on the second.
+        half = np.median(ts)
+        a, b = ts < half, ts >= half
+        if len(set(lab[a])) == 2 and len(set(lab[b])) == 2:
+            mid, d = probe_fit(emb[a], lab[a])
+            p = (emb[b] - mid) @ d
+            res['probe_auc'] = auc(p[lab[b] == 1], p[lab[b] == 0])
+            res['probe_caught'], _ = caught(p[lab[b] == 1], p[lab[b] == 0])
+    if ref is not None:
+        # Another channel by the first one's line, and by what was learned there: each answered span's share over it.
+        line, mid, d = ref
+        if line is not None:
+            res['spans'] = [[('ad' if lab[span == k][0] == 1 else 'show'), round(float(np.mean(score[span == k] > line)), 3),
+                             int((span == k).sum())] for k in sorted(set(span.tolist()))]
+        if d is not None:
+            p = (emb - mid) @ d
+            res['probe_from_auc'] = auc(p[lab == 1], p[lab == 0])
+    for k in list(res):
+        if isinstance(res[k], float):
+            res[k] = round(res[k], 4)
+    return res
+
+
+def score_run(spec):
+    """(1.8.0) Each scoring model in turn: its text half's lean, its picture half on the answered pictures, and how well
+    they part the ads from the programs, set by set."""
+    with bench_lock:
+        sets = list(spec.get('sets') or [])
+        bench.update({'state': 'running', 'note': '', 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'models': [], 'set': 'score',
+                      'memory_mb': round((meminfo('MemTotal') or 0) / 1e6), 'cores': os.cpu_count()})
+        r = bench['score'] = {'now': 'getting the words', 'sets': [], 'models': []}
+        say('the bench (score): started (%d sets)' % len(sets))
+        if not (os.path.isfile(VOCAB) and os.path.getsize(VOCAB) == VOCAB_SIZE and sha256(VOCAB) == VOCAB_SHA):
+            bench_get(VOCAB, VOCAB_URL, VOCAB_SIZE, VOCAB_SHA)
+        toks = ClipTokens(VOCAB)
+        pics = score_pictures(sets, r)
+        tz = int(spec.get('tz_minutes', 0))
+        clock = lambda t: time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t / 1000 + tz * 60))
+        for si, st in enumerate(sets):
+            ts = [p[2] for p in pics if p[0] == si]
+            r['sets'].append({'name': st.get('name', ''), 'files': st.get('_files', 0),
+                              'ads': sum(1 for p in pics if p[0] == si and p[1] == 1),
+                              'programs': sum(1 for p in pics if p[0] == si and p[1] == 0),
+                              'first': clock(min(ts)) if ts else None, 'last': clock(max(ts)) if ts else None})
+        if not pics:
+            bench['note'] = 'no answered pictures in the recordings'
+            raise RuntimeError(bench['note'])
+        lab_all = np.array([p[1] for p in pics])
+        ts_all = np.array([p[2] for p in pics], np.int64)
+        set_all = np.array([p[0] for p in pics])
+        span_all = np.array([p[4] for p in pics])
+        for mid, what, src, size, sha, side, norm, turl, tsize, tsha in SCORE_MODELS:
+            m = {'id': mid, 'what': what, 'note': '', 'sets': []}
+            r['models'].append(m)
+            got = []
+            try:
+                vpath = MODEL if mid == MODEL_ID else SPOT_MODEL if mid == SPOT_ID else os.path.join(DATA, 'score-%s-vision.onnx' % mid)
+                tpath = os.path.join(DATA, 'score-%s-text.onnx' % mid)
+                free = shutil.disk_usage(DATA).free
+                if free < tsize + size + BENCH_ROOM:
+                    raise IOError('no room for it (%d MB free)' % (free // 1_000_000))
+                if not src and not os.path.isfile(vpath):
+                    raise IOError('its picture half is not downloaded yet')
+                r['now'] = '%s: downloading its text half' % what
+                got.append(tpath)
+                bench_get(tpath, turl, tsize, tsha)
+                d = score_words(tpath, toks)
+                os.remove(tpath)
+                if src:
+                    r['now'] = '%s: downloading its picture half' % what
+                    got.append(vpath)
+                    bench_get(vpath, src, size, sha)
+                roomy(vpath)
+                s = bench_session(vpath, THREADS_ALL)
+                inp = s.get_inputs()[0].name
+                out_name = embed_name(s)
+                emb, run_s = [], 0.0
+                for k, p in enumerate(pics):
+                    if k % 25 == 0:
+                        r['now'] = '%s: %d of %d pictures' % (what, k, len(pics))
+                    while time.time() - state['last_look'] < BENCH_QUIET and not bench.get('busy'):
+                        r['now'] = '%s: waiting for the TVs to stop asking (%d of %d pictures)' % (what, k, len(pics))
+                        time.sleep(2)
+                    x = bench_input(p[3], side, norm)
+                    t0 = time.time()
+                    e = s.run([out_name], {inp: x})[0][0].astype(np.float32)
+                    run_s += time.time() - t0
+                    emb.append(e / np.linalg.norm(e))
+                del s
+                emb = np.array(emb, np.float32)
+                m['ms'] = round(run_s * 1000 / len(pics))
+                score = emb @ d
+                if mid == MODEL_ID and len(direction) == emb.shape[1]:
+                    # The TVs' lean now (direction.bin) beside it: how like the two are, and how the TVs' own does.
+                    m['words_like_now'] = round(float(d @ direction), 4)
+                    live = emb @ direction
+                ref = None
+                for si, st in enumerate(sets):
+                    sel = set_all == si
+                    if not sel.any():
+                        m['sets'].append({'name': st.get('name', ''), 'note': 'no pictures'})
+                        continue
+                    lab, ts, span = lab_all[sel], ts_all[sel], span_all[sel]
+                    use = None
+                    if st.get('line_from') is not None and ref is not None and int(st['line_from']) == ref[0]:
+                        use = ref[1:]
+                    res = score_set(st, emb[sel], score[sel], lab, ts, span, use)
+                    if mid == MODEL_ID and len(direction) == emb.shape[1]:
+                        lv = live[sel]
+                        a = auc(lv[lab == 1], lv[lab == 0])
+                        res['now_auc'] = None if a is None else round(a, 4)
+                        res['now_over_ad'] = {'ads': round(float(np.mean(lv[lab == 1] > AD)), 3) if (lab == 1).any() else None,
+                                              'programs': round(float(np.mean(lv[lab == 0] > AD)), 3) if (lab == 0).any() else None}
+                    m['sets'].append(res)
+                    if ref is None and st.get('probe') and len(set(lab.tolist())) == 2:
+                        pm, pd = probe_fit(emb[sel], lab)
+                        ref = (si, res.get('line'), pm, pd)
+                m['dim'] = int(emb.shape[1])
+                m['note'] = 'scored %d pictures (%d ms each on %d cores)' % (len(pics), m['ms'], THREADS_ALL)
+                say('the bench (score): %s: %s' % (what, json.dumps(m['sets'])))
+            except Exception as e:
+                m['note'] = "couldn't be scored (%s)" % (e if isinstance(e, (IOError, RuntimeError)) else type(e).__name__)
+                say('the bench (score): %s: %s' % (what, m['note']))
+            finally:
+                for p in got:
+                    for f in (p, p + '.part'):
+                        if os.path.isfile(f) and os.path.basename(f).startswith('score-'):
+                            os.remove(f)
+        r['now'] = 'done'
+        bench['state'] = 'done'
+        bench['note'] = '%d of %d scored' % (sum(1 for m in r['models'] if 'ms' in m), len(SCORE_MODELS))
+        say('the bench (score): done (%s)' % bench['note'])
+
+
 def home_network(addr):
     try:
         ip = ipaddress.ip_address(addr)
@@ -1619,12 +1971,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(503, {'note': 'not until the main model is ready'})
             asked = query.split('&')
             which = 'all' if 'set=all' in asked else 'read' if 'set=read' in asked else 'one'
+            if 'set=score' in asked:  # (1.8.0) the pictures' answers come with it
+                n = int(self.headers.get('Content-Length') or 0)
+                if n <= 0 or n > 1_000_000:
+                    return self.reply(400, {'note': 'the sets to score, as JSON, up to 1 MB'})
+                try:
+                    which = json.loads(self.rfile.read(n))
+                    if not isinstance(which, dict) or not which.get('sets'):
+                        raise ValueError('no sets')
+                except Exception as e:
+                    return self.reply(400, {'note': 'not sets it could use (%s)' % type(e).__name__})
             if which == 'read' and not state['read_ready']:
                 return self.reply(503, {'note': 'not until the reading models are ready'})
             bench['state'] = 'running'
             bench['busy'] = 'busy=1' in query.split('&')
             threading.Thread(target=bench_run, args=(which,), daemon=True).start()
-            return self.reply(202, {'note': 'the bench (%s) started: GET /bench says how far it is' % which})
+            return self.reply(202, {'note': 'the bench (%s) started: GET /bench says how far it is' % ('score' if isinstance(which, dict) else which)})
         if path == '/ads/forget':
             n = int(self.headers.get('Content-Length') or 0)
             if n <= 0 or n > 1_000_000:

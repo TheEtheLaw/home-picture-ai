@@ -59,6 +59,22 @@ read on 2 cores as a TV reads a whole picture. `GET /bench` then says, for each,
 (`edges`) and how long the TVs' own reader takes at 960 and 1280 (`tv_reader_ms`). Nothing is kept but those numbers
 and words.
 
+Since 1.8.0 `POST /bench?set=score` scores the models on his recordings, with the answers as JSON: `{"tz_minutes":
+-300, "sets": [{"name", "channel", "from", "to", "every", "ads": [[from, to], ...], "programs": [[from, to], ...],
+"look", "probe", "line_from"}]}`. Times are ms since 1970; `channel`, `from` and `to` pick the recordings (the
+channel's name without spaces or signs, the first and last minutes as the recordings' names start); `every` is the
+least ms between two pictures of a span; `look` also scores the likeness to the program's look (made from the first
+30% of the set's program, tried on the rest), `probe` a lean learned from the first half of the set's answers (tried
+on the second), and `line_from` scores this set by an earlier set's line and learned lean. Each model's lean comes from
+its own text half (CLIP's word pieces, the same 14 kinds of ad and 15 of program for every model). `GET /bench` then
+says under `score`: each set's pictures (`files`, `ads`, `programs`, its `first` and `last` at the set's time), and for
+each model, set by set: `auc` (how often an ad's picture leans further than a program's: 0.5 a coin's toss, 1 always),
+`caught` (the share of ads over the `line` that lets 2% of the program's pictures over), `look_auc`, `look_caught`,
+`both_auc`, `both_caught`, `probe_auc`, `probe_caught`, `spans` (each answered span's share over the earlier set's
+line, and how many pictures) and `probe_from_auc`; for the TVs' model now also `now_auc` and `now_over_ad` (by the lean
+the TVs use now) and `words_like_now` (how like that lean the words' is); and `ms`, its time for a picture on all
+cores. Text halves and new models are downloaded (fixed versions, checked by SHA-256) and deleted after.
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how
