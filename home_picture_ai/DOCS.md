@@ -73,7 +73,8 @@ each model, set by set: `auc` (how often an ad's picture leans further than a pr
 `both_auc`, `both_caught`, `probe_auc`, `probe_caught`, `spans` (each answered span's share over the earlier set's
 line, and how many pictures) and `probe_from_auc`; for the TVs' model now also `now_auc` and `now_over_ad` (by the lean
 the TVs use now) and `words_like_now` (how like that lean the words' is); and `ms`, its time for a picture on all
-cores. Text halves and new models are downloaded (fixed versions, checked by SHA-256) and deleted after.
+cores. Text halves and new models are downloaded (fixed versions, checked by SHA-256) and deleted after. Since 1.9.2 `"models": [ids]` scores only those (on the same pictures,
+so their scores line up with an earlier run's).
 
 ## Each channel's own lesson (since 1.9.0)
 
@@ -97,7 +98,8 @@ this channel's own test (the same channel from another provider, a sister channe
 held. A lesson in use goes with every answer for its channel: `"lesson": {"score", "line", "from", "held"}` (`from`:
 `own` or the channel it's from). `GET /lessons` says how each channel's went (learned, tested, used or not, why) and
 what's kept; `POST /lessons/learn[?before=MS][&channels=A,B]` learns now (a test can learn from what came before a
-time). Another main model starts the lessons over.
+time). Another main model starts the lessons over. Since 1.9.2 a time more than a day from the Pi's own clock isn't kept, unless it's a
+replay that teaches (`learn=1` with either: a recording's own times).
 
 ## How it works
 

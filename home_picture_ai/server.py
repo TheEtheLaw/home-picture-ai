@@ -75,7 +75,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.9.1'
+VERSION = '1.9.2'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -930,7 +930,7 @@ def spot_look(rgb, box):
             'spot': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
 
 
-def look(jpeg, box=None, ch=None, t=None, replay=False):
+def look(jpeg, box=None, ch=None, t=None, replay=False, learn=False):
     im = Image.open(io.BytesIO(jpeg))
     if im.width * im.height > MAX_PIXELS:
         raise ValueError('too big')
@@ -949,7 +949,7 @@ def look(jpeg, box=None, ch=None, t=None, replay=False):
            'known': round(ads.known(e), 4), 'embedding': base64.b64encode(e.astype('<f4').tobytes()).decode('ascii')}
     key = lesson_key(ch)
     if key:  # (1.9.0) the channel's: what the AI saw kept for its lesson (not a replay's), and its lesson's word
-        if t is not None and not replay:
+        if t is not None and not replay and lesson_time_ok(t, learn):
             try:
                 looklog.add(key, t, e)
             except Exception as ex:
@@ -1862,7 +1862,10 @@ def score_run(spec):
         ts_all = np.array([p[2] for p in pics], np.int64)
         set_all = np.array([p[0] for p in pics])
         span_all = np.array([p[4] for p in pics])
+        only = set(spec.get('models') or [])  # (1.9.2) only these (their scores line up with an earlier run's)
         for mid, what, src, size, sha, side, norm, turl, tsize, tsha in SCORE_MODELS:
+            if only and mid not in only:
+                continue
             m = {'id': mid, 'what': what, 'note': '', 'sets': []}
             r['models'].append(m)
             got = []
@@ -1941,7 +1944,7 @@ def score_run(spec):
                             os.remove(f)
         r['now'] = 'done'
         bench['state'] = 'done'
-        bench['note'] = '%d of %d scored' % (sum(1 for m in r['models'] if 'ms' in m), len(SCORE_MODELS))
+        bench['note'] = '%d of %d scored' % (sum(1 for m in r['models'] if 'ms' in m), len(r['models']))
         say('the bench (score): done (%s)' % bench['note'])
 
 
@@ -2075,7 +2078,17 @@ class LookLog:
 looklog = LookLog()
 
 
-def lesson_event(body, replay=False):
+LESSON_NEAR_NOW = 86400_000  # (1.9.2) a TV's time this far from the Pi's at most (one replayed to teach: any)
+
+
+def lesson_time_ok(t, learn=False):
+    """(1.9.2) Whether a TV's time (ms since 1970) can be kept: near the Pi's own clock, or a replay's that teaches
+    (its recording's times). 268: Home 2.16 and 2.17 sent their watch's own clock (from the Shield's start), kept under
+    1970."""
+    return learn or abs(t - time.time() * 1000) <= LESSON_NEAR_NOW
+
+
+def lesson_event(body, replay=False, learn=False):
     """(1.9.0) A TV's word on its channel: a run of the AI's ads that ended (real or not), a screen that came down, the
     show on now. A replay's are left out (its pictures are the recordings', already counted)."""
     j = json.loads(body)
@@ -2098,6 +2111,8 @@ def lesson_event(body, replay=False):
         when = ev['from']
     if replay:
         return {'kept': False, 'note': "a replay's: not kept"}
+    if not lesson_time_ok(when, learn):
+        return {'kept': False, 'note': 'its time is more than a day from now: not kept'}
     d = events_dir(key)
     with lesson_write:
         os.makedirs(d, exist_ok=True)
@@ -2512,7 +2527,7 @@ def lessons_view():
                     head = f.read(len(LOOK_HEAD) + 2)
                 if head[:len(LOOK_HEAD)] == LOOK_HEAD:
                     n = (os.path.getsize(p) - len(head)) // (12 + struct.unpack('>h', head[len(LOOK_HEAD):])[0])
-            kept[key] = {'days': len(days), 'pictures_today': n}
+            kept[key] = {'days': len(days), 'pictures_today': n, 'day_list': days[-7:]}
         for key in sorted(os.listdir(events_dir())) if os.path.isdir(events_dir()) else []:
             p = os.path.join(events_dir(key), today + '.jsonl')
             counts = {}
@@ -2651,7 +2666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if n <= 0 or n > 10_000:
                 return self.reply(400, {'note': 'an event, as JSON'})
             try:
-                return self.reply(200, lesson_event(self.rfile.read(n), 'replay=1' in query.split('&')))
+                return self.reply(200, lesson_event(self.rfile.read(n), 'replay=1' in query.split('&'), 'learn=1' in query.split('&')))
             except Exception as e:
                 return self.reply(400, {'note': 'not an event it could use (%s)' % type(e).__name__})
         if path == '/lessons/learn':  # (1.9.0) learned now (a test can give a time to learn from what came before)
@@ -2671,7 +2686,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(202, {'note': 'learning: GET /lessons says when it is done'})
         if path != '/look':
             return self.reply(404, {'note': 'POST /look, POST /read, POST /ads or POST /lessons/event'})
-        box, ch, t, replay = None, None, None, False
+        box, ch, t, replay, learn = None, None, None, False, False
         for kv in query.split('&'):
             if kv.startswith('spot='):
                 box = spot_box(kv[5:])
@@ -2681,6 +2696,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 t = int(kv[2:])
             elif kv == 'replay=1':
                 replay = True
+            elif kv == 'learn=1':  # (1.9.2) a replay that teaches: its recording's times
+                learn = True
         n = int(self.headers.get('Content-Length') or 0)
         if n <= 0 or n > 4_000_000:
             return self.reply(400, {'note': 'a JPEG, up to 4 MB'})
@@ -2688,7 +2705,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not state['ready']:
             return self.reply(503, {'note': state['note']})
         try:
-            return self.reply(200, look(body, box, ch, t, replay))
+            return self.reply(200, look(body, box, ch, t, replay, learn))
         except Exception as e:
             return self.reply(400, {'note': 'not a picture it could read (%s)' % type(e).__name__})
 

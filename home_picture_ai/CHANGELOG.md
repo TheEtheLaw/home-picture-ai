@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.2
+
+- A TV's picture times and words more than a day from the Pi's own clock aren't kept for the lessons (a replay that
+  teaches, `learn=1`, keeps its recording's times). `GET /lessons` lists each channel's latest days kept.
+- The scoring can be asked for some of its models only (`"models": [ids]` in the sets sent): their scores line up with
+  an earlier run's, the pictures being the same.
+
 ## 1.9.1
 
 - A channel's pictures or words sent twice (a recording replayed to teach it again) count once.
