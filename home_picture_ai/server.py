@@ -75,7 +75,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-VERSION = '1.9.2'
+VERSION = '1.9.3'
 PORT = 8765
 MODEL_ID = 'clip-vit-b32'
 MODEL_URL = ('https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/'
@@ -1972,6 +1972,9 @@ LESSON_NEAR = 20_000        # a screen this near a real break is that break's
 LESSON_GAP = 10_000         # pictures further apart than this aren't one stretch of watching
 LESSON_RUN_START, LESSON_RUN_END = 3, 2  # as the TV: 3 ad words in a row start a run, 2 of the program end it
 LESSON_FP = 0.02            # its line: 2% of the program's pictures over it
+LESSON_GAME_MOST = 90_000   # (1.9.3) a run of the AI's ads nothing backed, this short, between the show's own words: the game
+LESSON_GAME_NEAR = 75_000   # the show's own words this near before it and after it (a TV reads them each 45 s outside breaks)
+LESSON_EVERY_GAME = 1000    # the game's pictures the AI took for ads, one a second to learn from (each 4 s: too few)
 # To pass: it parts the test day's breaks from its program, its screen covers the real breaks, and it puts the screen
 # up outside them at most PASS_FALSE seconds an hour; a show watched at least HOLD_LEAST minutes with more than
 # HOLD_FALSE seconds an hour of it is held (the TV's rules there).
@@ -2090,16 +2093,23 @@ def lesson_time_ok(t, learn=False):
 
 def lesson_event(body, replay=False, learn=False):
     """(1.9.0) A TV's word on its channel: a run of the AI's ads that ended (real or not), a screen that came down, the
-    show on now. A replay's are left out (its pictures are the recordings', already counted)."""
+    show on now; (1.9.3) the show's own words read on screen (its scoreboard), whether anything besides the AI backed a
+    run or a screen (a silence or black where it began, ads seen before, an ad's words), and a screen he took down with
+    Back. A replay's are left out (its pictures are the recordings', already counted)."""
     j = json.loads(body)
     key = lesson_key(j.get('channel'))
     kind = j.get('kind')
-    if not key or kind not in ('run', 'screen', 'show'):
+    if not key or kind not in ('run', 'screen', 'show', 'words'):
         raise ValueError('not an event')
     ev = {'kind': kind}
-    if kind == 'show':
+    if kind in ('show', 'words'):
         ev['at'] = int(j['at'])
-        ev['name'] = str(j.get('name') or '')[:120]
+        if kind == 'show':
+            ev['name'] = str(j.get('name') or '')[:120]
+        elif j.get('what') != 'show':
+            raise ValueError('not an event')
+        else:
+            ev['what'] = 'show'
         when = ev['at']
     else:
         ev['from'], ev['to'] = int(j['from']), int(j['to'])
@@ -2108,6 +2118,10 @@ def lesson_event(body, replay=False, learn=False):
         if kind == 'run':
             ev['real'] = bool(j.get('real'))
             ev['why'] = str(j.get('why') or '')[:120]
+        if 'backed' in j:
+            ev['backed'] = bool(j['backed'])
+        if kind == 'screen' and j.get('back'):
+            ev['back'] = True
         when = ev['from']
     if replay:
         return {'kept': False, 'note': "a replay's: not kept"}
@@ -2144,6 +2158,40 @@ def lesson_events(key, days):
     return sorted(set(runs)), sorted(set(screens)), sorted(set(shows))  # (1.9.1) a word sent twice: once
 
 
+def lesson_games(key, days):
+    """(1.9.3) Where the TV's AI took the program for ads (a sports channel's own schedule of its next games, during the
+    game, put its screen up for 20 s): a run of its ads that nothing besides the AI backed
+    (no silence or black where it began, no ad's words, no ad seen before), at most LESSON_GAME_MOST long, with the
+    show's own words on screen within LESSON_GAME_NEAR before it and after it; and a screen he took down with Back that
+    nothing backed. Their pictures are the program's to learn from: [(from, to)]. A TV before Home 2.20 doesn't say
+    what backed a run or a screen: none of its are."""
+    runs, backs, words = set(), set(), set()
+    for day in days:
+        try:
+            with open(os.path.join(events_dir(key), day + '.jsonl'), encoding='utf-8') as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            k = ev.get('kind')
+            if k == 'run' and not ev.get('real') and ev.get('backed') is False:
+                runs.add((int(ev['from']), int(ev['to'])))
+            elif k == 'screen' and ev.get('back') and ev.get('backed') is False:
+                backs.add((int(ev['from']), int(ev['to'])))
+            elif k == 'words' and ev.get('what') == 'show':
+                words.add(int(ev['at']))
+    w = np.array(sorted(words), np.int64)
+
+    def said(a, b):
+        return bool(len(w)) and bool(((w >= a) & (w <= b)).any())
+    out = {(a, b) for a, b in runs if b - a <= LESSON_GAME_MOST and said(a - LESSON_GAME_NEAR, a) and said(b, b + LESSON_GAME_NEAR)}
+    return sorted(out | backs)
+
+
 def in_spans(t, spans):
     """For each time, whether it's inside any of the spans [(from, to)]."""
     out = np.zeros(len(t), bool)
@@ -2152,22 +2200,24 @@ def in_spans(t, spans):
     return out
 
 
-def lesson_labels(t, runs, screens):
+def lesson_labels(t, runs, screens, games=()):
     """Each picture's answer: 1 an ad (inside a real break, its edges left out), 0 the program (well away from any run
-    and any screen), -1 neither."""
+    and any screen; (1.9.3) or inside a stretch the AI took for ads that was the game, lesson_games), -1 neither."""
     ad = in_spans(t, [(a + LESSON_TRIM, b - LESSON_TRIM) for a, b, real in runs if real and b - a > 2 * LESSON_TRIM])
     near = in_spans(t, [(a - LESSON_AWAY, b + LESSON_AWAY) for a, b, _ in runs] + [(a - LESSON_AWAY, b + LESSON_AWAY) for a, b in screens])
     lab = np.full(len(t), -1, np.int8)
     lab[~near] = 0
+    lab[in_spans(t, games) & ~ad] = 0
     lab[ad] = 1
     return lab
 
 
-def lesson_sample(t, lab):
-    """One picture of each answer each LESSON_EVERY ms: their places."""
+def lesson_sample(t, lab, dense=None):
+    """One picture of each answer each LESSON_EVERY ms: their places; (1.9.3) the {@code dense} ones (the game the AI took
+    for ads) one each LESSON_EVERY_GAME ms."""
     keep, seen = [], set()
     for i in np.flatnonzero(lab >= 0):
-        k = (int(lab[i]), int(t[i]) // LESSON_EVERY)
+        k = (int(lab[i]), 'g', int(t[i]) // LESSON_EVERY_GAME) if dense is not None and dense[i] else (int(lab[i]), int(t[i]) // LESSON_EVERY)
         if k not in seen:
             seen.add(k)
             keep.append(i)
@@ -2281,9 +2331,11 @@ def lesson_channel(key, before=None):
     if before is not None:
         days = [x for x in days if x <= lesson_day(before)]
     runs, screens, shows = lesson_events(key, days)
+    games = lesson_games(key, days)
     if before is not None:
         runs = [r for r in runs if r[1] < before]
         screens = [s for s in screens if s[1] < before]
+        games = [g for g in games if g[1] < before]
     per_day = []
     for day in days:
         t, e = LookLog.read(key, day)
@@ -2292,11 +2344,13 @@ def lesson_channel(key, before=None):
             t, e = t[keep], e[keep]
         if not len(t):
             continue
-        lab = lesson_labels(t, runs, screens)
-        pick = lesson_sample(t, lab)
+        lab = lesson_labels(t, runs, screens, games)
+        dense = in_spans(t, games) & (lab == 0)
+        pick = lesson_sample(t, lab, dense)
         breaks = sum(1 for a, b, r in runs if r and lesson_day(a) == day)
         per_day.append({'day': day, 'X': e[pick], 'y': lab[pick].astype(np.int64), 't': t[pick], 'breaks': breaks,
-                        'program': int((lab[pick] == 0).sum())})
+                        'program': int((lab[pick] == 0).sum()), 'games': sum(1 for a, b in games if lesson_day(a) == day),
+                        'game_pictures': int(dense[pick].sum())})
     return per_day, runs, screens, shows
 
 
@@ -2323,6 +2377,9 @@ def lesson_learn_one(key, before=None):
     per_day, runs, screens, shows = lesson_channel(key, before)
     out = {'channel': key, 'days': len(per_day), 'breaks': sum(p['breaks'] for p in per_day),
            'program_min': round(sum(p['program'] for p in per_day) * LESSON_EVERY / 60000), 'passed': False}
+    if sum(p['games'] for p in per_day):  # (1.9.3)
+        out['games'] = sum(p['games'] for p in per_day)
+        out['game_pictures'] = sum(p['game_pictures'] for p in per_day)
     test = next((p for p in reversed(per_day) if p['breaks'] >= LEAST_BREAKS and p['program'] >= LEAST_PROGRAM), None)
     if test is None:
         out['note'] = 'learning: not a day with %d real breaks and %d min of program yet' % (LEAST_BREAKS, LEAST_PROGRAM * LESSON_EVERY // 60000)

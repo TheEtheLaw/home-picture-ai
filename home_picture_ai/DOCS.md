@@ -101,6 +101,13 @@ what's kept; `POST /lessons/learn[?before=MS][&channels=A,B]` learns now (a test
 time). Another main model starts the lessons over. Since 1.9.2 a time more than a day from the Pi's own clock isn't kept, unless it's a
 replay that teaches (`learn=1` with either: a recording's own times).
 
+Since 1.9.3 a lesson also learns the program's own stretches that the AI took for ads (a channel's schedule of its next
+games during the game, say): a run of the AI's ads that nothing besides the AI backed (no silence or black where it
+began, no ad's words, no ad seen before), at most 90 seconds long, with the show's own words on screen within 75
+seconds before it and after it; and a screen he took down with Back that nothing backed. Their pictures are learned as
+the program, one a second. The TV says what backed a run or a screen (`"backed"`), a screen taken down with Back
+(`"back": true`), and the show's own words read on screen (`{"channel", "kind": "words", "at", "what": "show"}`).
+
 ## How it works
 
 - `POST /look` with a JPEG: `{"model", "score", "embedding", "ad", "like", "sure", "known", "ms"}`. `score` is how

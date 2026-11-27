@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.3
+
+- A channel's lesson learns the program's own stretches that the AI took for ads: a run of its ads that nothing besides
+  the AI backed (no silence or black where it began, no ad's words, no ad seen before), at most 90 seconds long, with the
+  show's own words on screen (its scoreboard) within 75 seconds before it and after it, and a screen he took down with
+  Back that nothing backed. Their pictures are learned as the program, one a second. A TV says so from Home 2.20
+  (`POST /lessons/event`: `"backed"` on a run or a screen, `"back"` on a screen, and `{"kind": "words", "at",
+  "what": "show"}`).
+
 ## 1.9.2
 
 - A TV's picture times and words more than a day from the Pi's own clock aren't kept for the lessons (a replay that
