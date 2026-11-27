@@ -11,7 +11,9 @@ The TVs send the names of the channels they need a guide for (`POST /channels` w
 around a site's checks): tvpassport.com and tvinsider.com (the US and Canada), tv24.co.uk and Virgin TV Go (the UK),
 Plex's free channels, and Sky. A name is matched by its words ("ESPN 2" is "ESPN2"; "FS1" is "Fox Sports 1"), its feed
 (East or West: hours apart) and its country (a word before it: "US:", "UK|", "USA "). A match must be clear, well ahead
-of the next best of another name, or there is none: no guide is better than another channel's.
+of the next best of another name, or there is none: no guide is better than another channel's. A local station is
+matched by its call sign ("FOX 11 (KTTV) Los Angeles") to that station's own listing, or by its network and city alone
+("NBC Los Angeles") when that network has just one station there.
 
 Twice a day the grabber reads the matched channels' next two days; the TVs take the shows (`GET /programs[?keys=a,b]`:
 each channel's shows, two hours back to two days ahead, and the site they're from). The grabber itself is fetched on the

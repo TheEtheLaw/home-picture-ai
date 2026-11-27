@@ -1,5 +1,5 @@
 name: Home guide
-version: "1.0.0"
+version: "1.0.1"
 slug: home_guide
 description: A TV guide for the channels the TVs at home ask for, read each day from TV listing sites by the iptv-org EPG grabber.
 url: https://github.com/TheEtheLaw/home-picture-ai

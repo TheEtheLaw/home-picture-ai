@@ -23,7 +23,7 @@ import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 PORT = int(os.environ.get('HOME_GUIDE_PORT', 8767))
 DATA = os.environ.get('HOME_GUIDE_DATA', '/data')
 EPG = os.environ.get('HOME_GUIDE_EPG', os.path.join(DATA, 'epg'))
@@ -38,7 +38,7 @@ DAYS = 2
 GRAB_EVERY = 12 * 3600       # s: the shows read again this often
 UPDATE_EVERY = 24 * 3600     # s: the grabber's code and its sites' channels brought up to date this often
 SETTLE = 120                 # s: a new list of channels from a TV is matched and read this long after it came
-MATCH_LEAST = 0.74           # a match this good at least,
+MATCH_LEAST = 0.8            # a match this good at least (1.0.1: 0.74 took "Sportsnet LA Lakers" for SportsNet LA),
 MATCH_AHEAD = 0.06           # and this far ahead of the next best of another name
 KEEP_BACK, KEEP_AHEAD = 2 * 3600_000, 48 * 3600_000   # ms of shows kept around now
 DESC_MOST = 300
@@ -150,6 +150,32 @@ def words(name, country=''):
 
 SOFT = {'channel', 'network', 'tv', 'television'}   # words a channel's name has or hasn't ("History", "History Channel")
 
+# (1.0.1) A local station: its call sign, in brackets or first ("FOX 11 (KTTV) Los Angeles", "KTLA Los Angeles"; "KABC-TV2"
+# its second channel; not a word like "WEST" in "Fox News - WEST"), the network it's named for and its place.
+_SIGN = r'([KW][A-Z]{2,3})(?:-?(?:DT|TV|LD|CD|CA|LP))?(\d{1,2})?'
+CALL = re.compile(r'[(\[]\s*' + _SIGN + r'\s*[)\]]|^\s*(?:[A-Za-z]{2,3}\s*[:|]\s*)?' + _SIGN + r'\s+\S')
+NETWORKS = {'abc', 'nbc', 'cbs', 'fox', 'cw', 'pbs', 'mnt', 'mytv', 'telemundo', 'univision', 'uni', 'unimas', 'ion'}
+
+
+def calls(name):
+    """A local station's call signs in a name, each with its channel (0: its main one; 2 in "KABC-TV2", 4 in "KTTV4")."""
+    out = []
+    for m in CALL.finditer(name or ''):
+        sign, sub = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        if sign.lower() not in FEEDS:
+            out.append((sign.lower(), int(sub) if sub else 0))
+    return out
+
+
+def place(toks, call_words=()):
+    """The words of a name that say where (its city and state): not its network, call sign, number or a letter."""
+    return {t for t in toks if t not in NETWORKS and t not in call_words and not t.isdigit() and len(t) > 1 and t not in SOFT}
+
+
+def same_place(a, b):
+    """Two names' places agree: either says none, or they share a word ("Bay Area, CA" and "San Jose, CA")."""
+    return not a or not b or bool(a & b)
+
 
 def score(mine, theirs):
     """How alike two channels' words are (0 to 1): what they share against what either has that the other hasn't;
@@ -212,8 +238,38 @@ def build_index():
                 seen.add(k)
                 toks, feed, _ = words(name)
                 if toks:
-                    out.append((site, sid, lang or 'en', name, toks, feed, country))
+                    cs = calls(name)
+                    out.append((site, sid, lang or 'en', name, toks, feed, country, cs, place(toks, {c for c, _ in cs})))
     return out
+
+
+def match_local(name, idx):
+    """(1.0.1) One of his channels that's a local station, to the sites' channel of that station: by its call sign (the
+    same channel of it, and not another place: a station's call sign is its own), else by the network and its place
+    alone ("NBC Los Angeles", "ABC [New York]": the one station of that network there; not with a number, which the sites
+    don't say: "CBS 9 Los Angeles" is KCAL, not CBS's KCBS). None if it isn't one, or no station is clearly it."""
+    vs = [v for v in variants(name) if v[0] and v[2] in ('', 'us')]  # its words without a country before it ("US: ")
+    if not vs:
+        return None
+    toks = vs[-1][0]
+    mine = calls(name)
+    if mine:
+        here = place(toks, {c for c, _ in mine})
+        found = [e for e in idx if e[6] == 'us' and any(c in e[7] for c in mine) and same_place(here, e[8])]
+    else:
+        net, rest = toks[0], toks[1:]
+        if net not in NETWORKS or not rest or any(t.isdigit() for t in rest) or set(rest) & NETWORKS:
+            return None
+        found = [e for e in idx if e[6] == 'us' and e[4][0] == net and any(sub == 0 for _, sub in e[7])
+                 and set(rest) <= e[8]]
+        if len({c for e in found for c, sub in e[7] if sub == 0}) != 1:
+            return None  # none there, or two of that network's stations: not clear
+    if not found:
+        return None
+    found.sort(key=lambda e: (-score(toks, e[4]), SITE_ORDER.get(e[0], 9), e[3]))
+    e = found[0]
+    return {'site': e[0], 'site_id': e[1], 'lang': e[2], 'site_name': e[3], 'score': 1.0 if mine else 0.95,
+            'by': 'its call sign' if mine else 'its network and place'}
 
 
 def match_one(name, idx):
@@ -221,9 +277,12 @@ def match_one(name, idx):
     vs = [v for v in variants(name) if v[0]]
     if not vs:
         return None, 'no words in its name'
+    local = match_local(name, idx)
+    if local:
+        return local, ''
     best = {}
     for toks, feed, country, less in vs:
-        for site, sid, lang, sname, stoks, sfeed, scountry in idx:
+        for site, sid, lang, sname, stoks, sfeed, scountry, _, _ in idx:
             if country and scountry != country:
                 continue
             s = score(toks, stoks) - less
@@ -557,7 +616,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.answer(400, {'error': 'not a list of channels'})
             with lock:
                 before = [(c['key'], c['name']) for c in wanted.get(tv, {}).get('channels', [])]
-                wanted[tv] = {'at': time.time(), 'channels': chans}
+                if chans:
+                    wanted[tv] = {'at': time.time(), 'channels': chans}
+                else:
+                    wanted.pop(tv, None)  # (1.0.1) a TV with none to ask for: gone
                 save_json('wanted.json', wanted)
             changed = before != [(c['key'], c['name']) for c in chans]  # by their names (what's matched)
             if changed:
@@ -593,7 +655,7 @@ def main():
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
     os.makedirs(DATA, exist_ok=True)
-    wanted.update(load_json('wanted.json', {}))
+    wanted.update({tv: w for tv, w in load_json('wanted.json', {}).items() if w.get('channels')})
     matches.update(load_json('matches.json', {}))
     guide.update(load_json('guide.json', {}))
     st = load_json('state.json', {})
